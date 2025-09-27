@@ -9,62 +9,35 @@ from pydantic import BaseModel
 
 from models.common import trunc_normal_init_
 from models.layers import rms_norm, SwiGLU, Attention, RotaryEmbedding, CosSin, CastedEmbedding, CastedLinear
-from models.sparse_embedding import CastedSparseEmbedding
+# CastedSparseEmbedding은 더 이상 필요 없으므로 제거해도 됩니다.
+# from models.sparse_embedding import CastedSparseEmbedding 
 
-
-@dataclass
-class HierarchicalReasoningModel_ACTV1InnerCarry:
-#H모듈, L모듈 은닉상태 저장용 데이터 클래스
-    z_H: torch.Tensor
-    z_L: torch.Tensor
-
-
-@dataclass
-class HierarchicalReasoningModel_ACTV1Carry:
-#전반적인 데이터를 담는 클래스
-    inner_carry: HierarchicalReasoningModel_ACTV1InnerCarry
-    
-    steps: torch.Tensor
-    halted: torch.Tensor
-    
-    current_data: Dict[str, torch.Tensor]
-
-
-class HierarchicalReasoningModel_ACTV1Config(BaseModel):
-#yaml의 하이퍼파라미터를 기반으로 모델을 생성하는 설계도 클래스
+# --- 1. 설정 클래스 (ARMConfig) 수정 ---
+class ARMConfig(BaseModel):
     batch_size: int
     seq_len: int
-    puzzle_emb_ndim: int = 0
+    # puzzle_emb_ndim을 선택적(Optional)으로 변경하고 기본값을 0으로 설정
+    puzzle_emb_ndim: int = 0 
     num_puzzle_identifiers: int
     vocab_size: int
-
-    H_cycles: int
-    L_cycles: int
-
-    H_layers: int
-    L_layers: int
-
-    # Transformer config
+    initial_modules: int
+    max_modules: int
+    inner_loops: int
+    reasoning_layers: int
     hidden_size: int
     expansion: float
     num_heads: int
     pos_encodings: str
-
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
-    
-    # Halting Q-learning config
     halt_max_steps: int
     halt_exploration_prob: float
-
     forward_dtype: str = "bfloat16"
 
-
-class HierarchicalReasoningModel_ACTV1Block(nn.Module):
-    #트랜스포머 블록(residual 항 포함)
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+# --- ARMBlock, ARMReasoningModule (변경 없음) ---
+class ARMBlock(nn.Module):
+    def __init__(self, config: ARMConfig) -> None:
         super().__init__()
-
         self.self_attn = Attention(
             hidden_size=config.hidden_size,
             head_dim=config.hidden_size // config.num_heads,
@@ -79,215 +52,135 @@ class HierarchicalReasoningModel_ACTV1Block(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Post Norm
-        # Self Attention
         hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
-        # Fully Connected
         hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
         return hidden_states
 
 
-class HierarchicalReasoningModel_ACTV1ReasoningModule(nn.Module):
-    #내부 추론 모듈(상대 측 정보는 input_injection으로 받아옴)
-    def __init__(self, layers: List[HierarchicalReasoningModel_ACTV1Block]):
+class ARMReasoningModule(nn.Module):
+    def __init__(self, layers: List[ARMBlock]):
         super().__init__()
+        self.layers = nn.ModuleList(layers)
 
-        self.layers = torch.nn.ModuleList(layers)
-
-    def forward(self, hidden_states: torch.Tensor, input_injection: torch.Tensor, **kwargs) -> torch.Tensor:
-        # Input injection (add)
-        hidden_states = hidden_states + input_injection
-        # Layers
+    def forward(self, hidden_states: torch.Tensor, **kwargs) -> torch.Tensor:
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
-
         return hidden_states
 
 
-class HierarchicalReasoningModel_ACTV1_Inner(nn.Module):
-    #HRM 구조
-    def __init__(self, config: HierarchicalReasoningModel_ACTV1Config) -> None:
+@dataclass
+class ARMInnerCarry:
+    z_states: List[torch.Tensor]
+
+# --- 3. ARM_Inner 클래스 수정 ---
+class ARM_Inner(nn.Module):
+    def __init__(self, config: ARMConfig) -> None:
         super().__init__()
         self.config = config
         self.forward_dtype = getattr(torch, self.config.forward_dtype)
 
-        # I/O
         self.embed_scale  = math.sqrt(self.config.hidden_size)
         embed_init_std = 1.0 / self.embed_scale
-        #토큰 임베딩, 출력 레이어, q러닝 레이어, 퍼즐 id임베딩 
         self.embed_tokens = CastedEmbedding(self.config.vocab_size, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         self.lm_head      = CastedLinear(self.config.hidden_size, self.config.vocab_size, bias=False)
         self.q_head       = CastedLinear(self.config.hidden_size, 2, bias=True)
 
-        self.puzzle_emb_len = -(self.config.puzzle_emb_ndim // -self.config.hidden_size)  # ceil div
-        if self.config.puzzle_emb_ndim > 0:
-            # Zero init puzzle embeddings
-            self.puzzle_emb = CastedSparseEmbedding(self.config.num_puzzle_identifiers, self.config.puzzle_emb_ndim,
-                                                    batch_size=self.config.batch_size, init_std=0, cast_to=self.forward_dtype)
-
-        # LM Blocks : rope임베딩 혹은 학습가능한 임베딩
+        # --- puzzle_emb 생성 로직 제거 ---
+        # self.puzzle_emb_len과 self.puzzle_emb를 조건 없이 제거합니다.
+        
         if self.config.pos_encodings == "rope":
+            # RoPE의 max_position_embeddings에서 puzzle_emb_len을 제거합니다.
             self.rotary_emb = RotaryEmbedding(dim=self.config.hidden_size // self.config.num_heads,
-                                              max_position_embeddings=self.config.seq_len + self.puzzle_emb_len,
+                                              max_position_embeddings=self.config.seq_len,
                                               base=self.config.rope_theta)
         elif self.config.pos_encodings == "learned":
-            self.embed_pos = CastedEmbedding(self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
+            self.embed_pos = CastedEmbedding(self.config.seq_len, self.config.hidden_size, init_std=embed_init_std, cast_to=self.forward_dtype)
         else:
             raise NotImplementedError()
 
-        # Reasoning Layers
-        self.H_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.H_layers)])
-        self.L_level = HierarchicalReasoningModel_ACTV1ReasoningModule(layers=[HierarchicalReasoningModel_ACTV1Block(self.config) for _i in range(self.config.L_layers)])
-        
-        # Initial states //Buffer는 자동으로 계산 그래프에 포함 안되게 함.
-        self.H_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
-        self.L_init = nn.Buffer(trunc_normal_init_(torch.empty(self.config.hidden_size, dtype=self.forward_dtype), std=1), persistent=True)
+        self.reasoning_modules = nn.ModuleList(
+            [ARMReasoningModule(layers=[ARMBlock(self.config) for _ in range(self.config.reasoning_layers)]) 
+             for _ in range(self.config.initial_modules)]
+        )
 
-        # Q head special init
-        # Init Q to (almost) zero for faster learning during bootstrapping
-        with torch.no_grad():
-            self.q_head.weight.zero_()
-            self.q_head.bias.fill_(-5)  # type: ignore #초기에 무시하게끔.
+        self.thalamus_gate = nn.Sequential(
+            CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=True),
+            nn.ReLU(),
+            CastedLinear(self.config.hidden_size, self.config.max_modules, bias=True)
+        )
 
+    # --- _input_embeddings 메소드 수정 ---
     def _input_embeddings(self, input: torch.Tensor, puzzle_identifiers: torch.Tensor):
-        #입력 임베딩 생성함수 
         # Token embedding
         embedding = self.embed_tokens(input.to(torch.int32))
 
-        # Puzzle embeddings
-        if self.config.puzzle_emb_ndim > 0:
-            puzzle_embedding = self.puzzle_emb(puzzle_identifiers)
-            
-            pad_count = self.puzzle_emb_len * self.config.hidden_size - puzzle_embedding.shape[-1]
-            if pad_count > 0:
-                puzzle_embedding = F.pad(puzzle_embedding, (0, pad_count))
+        # --- Puzzle embedding 관련 로직 전체 제거 ---
+        # if self.config.puzzle_emb_ndim > 0: ... 블록을 전부 삭제합니다.
 
-            embedding = torch.cat((puzzle_embedding.view(-1, self.puzzle_emb_len, self.config.hidden_size), embedding), dim=-2)
-
-        # Position embeddings
         if self.config.pos_encodings == "learned":
-            # scale by 1/sqrt(2) to maintain forward variance
             embedding = 0.707106781 * (embedding + self.embed_pos.embedding_weight.to(self.forward_dtype))
 
-        # Scale
         return self.embed_scale * embedding
+        
+    def add_new_expert_module(self):
+        # ... (이 함수는 변경 없음) ...
+        if len(self.reasoning_modules) < self.config.max_modules:
+            new_module = ARMReasoningModule(
+                layers=[ARMBlock(self.config) for _ in range(self.config.reasoning_layers)]
+            )
+            with torch.no_grad():
+                for param in new_module.parameters():
+                    trunc_normal_init_(param, std=1e-5)
+            device = next(self.parameters()).device
+            self.reasoning_modules.append(new_module.to(device))
+            print(f"New expert module added. Total modules: {len(self.reasoning_modules)}")
+            return True
+        return False
 
     def empty_carry(self, batch_size: int):
-        #HS 초기화
-        return HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-            z_L=torch.empty(batch_size, self.config.seq_len + self.puzzle_emb_len, self.config.hidden_size, dtype=self.forward_dtype),
-        )
+        # ... (이 함수는 변경 없음) ...
+        z_states = [torch.zeros(batch_size, self.config.seq_len, self.config.hidden_size, dtype=self.forward_dtype) 
+                    for _ in range(len(self.reasoning_modules))]
+        return ARMInnerCarry(z_states=z_states)
         
-    def reset_carry(self, reset_flag: torch.Tensor, carry: HierarchicalReasoningModel_ACTV1InnerCarry):
-        #HS 일부만 초기화(끝난 작업에 대한 기억만 선택적으로 제거)
-        return HierarchicalReasoningModel_ACTV1InnerCarry(
-            z_H=torch.where(reset_flag.view(-1, 1, 1), self.H_init, carry.z_H),
-            z_L=torch.where(reset_flag.view(-1, 1, 1), self.L_init, carry.z_L),
-        )
+    def reset_carry(self, reset_flag: torch.Tensor, carry: ARMInnerCarry):
+        # ... (이 함수는 변경 없음) ...
+        new_z_states = []
+        for z in carry.z_states:
+            new_z_states.append(torch.where(reset_flag.view(-1, 1, 1), 0.0, z))
+        return ARMInnerCarry(z_states=new_z_states)
 
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1InnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1InnerCarry, torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        seq_info = dict(
-            cos_sin=self.rotary_emb() if hasattr(self, "rotary_emb") else None,
-        )
+    def forward(self, carry: ARMInnerCarry, batch: Dict[str, torch.Tensor]) -> Tuple[ARMInnerCarry, Dict[str, torch.Tensor]]:
+        raise NotImplementedError("ARM_Inner.forward is controlled by the training loop in pretrain.py")
 
-        # Input encoding
-        input_embeddings = self._input_embeddings(batch["inputs"], batch["puzzle_identifiers"])
+# --- 4. ACT 래퍼 (ARM) 수정 ---
+@dataclass
+class ARMCarry:
+    inner_carry: ARMInnerCarry
+    steps: torch.Tensor
+    halted: torch.Tensor
+    current_data: Dict[str, torch.Tensor]
 
-        # Forward iterations : 1step 역전파
-        with torch.no_grad():
-            z_H, z_L = carry.z_H, carry.z_L
-
-            for _H_step in range(self.config.H_cycles):
-                for _L_step in range(self.config.L_cycles):
-                    if not ((_H_step == self.config.H_cycles - 1) and (_L_step == self.config.L_cycles - 1)):
-                        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-
-                if not (_H_step == self.config.H_cycles - 1):
-                    z_H = self.H_level(z_H, z_L, **seq_info)
-
-        assert not z_H.requires_grad and not z_L.requires_grad
-
-        # 1-step grad: L과 H모듈 모두 한번씩만 업데이트 됨.
-        z_L = self.L_level(z_L, z_H + input_embeddings, **seq_info)
-        z_H = self.H_level(z_H, z_L, **seq_info)
-
-        # LM Outputs
-        new_carry = HierarchicalReasoningModel_ACTV1InnerCarry(z_H=z_H.detach(), z_L=z_L.detach())  # New carry no grad
-        output = self.lm_head(z_H)[:, self.puzzle_emb_len:]
-
-        # Q head: H모듈의 정보만 보고 파악?
-        q_logits = self.q_head(z_H[:, 0]).to(torch.float32)
-        
-        return new_carry, output, (q_logits[..., 0], q_logits[..., 1])
-
-
-class HierarchicalReasoningModel_ACTV1(nn.Module):
-    """ACT wrapper."""
-
+class ARM(nn.Module):
     def __init__(self, config_dict: dict):
         super().__init__()
-        self.c
-        onfig = HierarchicalReasoningModel_ACTV1Config(**config_dict)
-        self.inner = HierarchicalReasoningModel_ACTV1_Inner(self.config)
+        self.config = ARMConfig(**config_dict)
+        self.inner = ARM_Inner(self.config)
 
-    @property
-    def puzzle_emb(self):
-        return self.inner.puzzle_emb
+    # --- puzzle_emb property 제거 ---
+    # @property
+    # def puzzle_emb(self):
+    #     return self.inner.puzzle_emb
 
     def initial_carry(self, batch: Dict[str, torch.Tensor]):
+        # ... (이 함수는 변경 없음) ...
         batch_size = batch["inputs"].shape[0]
-
-        return HierarchicalReasoningModel_ACTV1Carry(
-            inner_carry=self.inner.empty_carry(batch_size),  # Empty is expected, it will be reseted in first pass as all sequences are halted.
-            
+        return ARMCarry(
+            inner_carry=self.inner.empty_carry(batch_size),
             steps=torch.zeros((batch_size, ), dtype=torch.int32),
-            halted=torch.ones((batch_size, ), dtype=torch.bool),  # Default to halted
-            
+            halted=torch.ones((batch_size, ), dtype=torch.bool),
             current_data={k: torch.empty_like(v) for k, v in batch.items()}
         )
         
-    def forward(self, carry: HierarchicalReasoningModel_ACTV1Carry, batch: Dict[str, torch.Tensor]) -> Tuple[HierarchicalReasoningModel_ACTV1Carry, Dict[str, torch.Tensor]]:
-        # Update data, carry (removing halted sequences)
-        new_inner_carry = self.inner.reset_carry(carry.halted, carry.inner_carry)
-        
-        new_steps = torch.where(carry.halted, 0, carry.steps)
-
-        new_current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
-
-        # Forward inner model
-        new_inner_carry, logits, (q_halt_logits, q_continue_logits) = self.inner(new_inner_carry, new_current_data)
-
-        outputs = {
-            "logits": logits,
-            "q_halt_logits": q_halt_logits,
-            "q_continue_logits": q_continue_logits
-        }
-        
-        with torch.no_grad():
-            # Step: 추론시에는 최대 신호까지만... .. .. .. . .?
-            new_steps = new_steps + 1
-            is_last_step = new_steps >= self.config.halt_max_steps
-            
-            halted = is_last_step
-
-            # if training, and ACT is enabled
-            if self.training and (self.config.halt_max_steps > 1):
-                # Halt signal
-                # NOTE: During evaluation, always use max steps, this is to guarantee the same halting steps inside a batch for batching purposes
-                halted = halted | (q_halt_logits > q_continue_logits)
-
-                # Exploration
-                min_halt_steps = (torch.rand_like(q_halt_logits) < self.config.halt_exploration_prob) * torch.randint_like(new_steps, low=2, high=self.config.halt_max_steps + 1)
-
-                halted = halted & (new_steps >= min_halt_steps)
-
-                # Compute target Q
-                # NOTE: No replay buffer and target networks for computing target Q-value.
-                # As batch_size is large, there're many parallel envs.
-                # Similar concept as PQN https://arxiv.org/abs/2407.04811
-                next_q_halt_logits, next_q_continue_logits = self.inner(new_inner_carry, new_current_data)[-1]
-                
-                outputs["target_q_continue"] = torch.sigmoid(torch.where(is_last_step, next_q_halt_logits, torch.maximum(next_q_halt_logits, next_q_continue_logits)))
-
-        return HierarchicalReasoningModel_ACTV1Carry(new_inner_carry, new_steps, halted, new_current_data), outputs
+    def forward(self, carry: ARMCarry, batch: Dict[str, torch.Tensor]) -> Tuple[ARMCarry, Dict[str, torch.Tensor]]:
+        raise NotImplementedError("ARM.forward logic is handled by the custom training loop in pretrain.py")

@@ -1,21 +1,23 @@
-name: hrm.hrm_act_v1@HierarchicalReasoningModel_ACTV1
+name: arm.arm_v1@ARM
 loss:
-  name: losses@ACTLossHead
+  name: losses@ARMLossHead 
   loss_type: stablemax_cross_entropy
 
 halt_exploration_prob: 0.1
 halt_max_steps: 16
 
-H_cycles: 2
-L_cycles: 2
+initial_modules: 1 # 시작 시 추론 모듈의 개수
+max_modules: 8     # 최대 추론 모듈의 개수
 
-H_layers: 4
-L_layers: 4
+convergence_window: 1000 # 라우팅 엔트로피 계산 주기 (훈련 스텝 단위)
+entropy_threshold: 0.5   # 모듈 추가를 결정하는 라우팅 엔트로피 임계값
 
-hidden_size: 512
-num_heads: 8  # min(2, hidden_size // 64)
+inner_loops: 4 # 활성 모듈의 내부 반복 추론 횟수
+
+reasoning_layers: 1 # 각 추론 모듈 내부의 트랜스포머 레이어 수
+
+hidden_size: 256
+num_heads: 8
 expansion: 4
-
-puzzle_emb_ndim: ${.hidden_size}
 
 pos_encodings: rope

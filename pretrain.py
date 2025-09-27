@@ -104,59 +104,47 @@ def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size:
     )
     return dataloader, dataset.metadata
 
-
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
     model_cfg = dict(
-        **config.arch.__pydantic_extra__,  # type: ignore
-
+        **config.arch.__pydantic_extra__,
         batch_size=config.global_batch_size // world_size,
-
         vocab_size=train_metadata.vocab_size,
         seq_len=train_metadata.seq_len,
         num_puzzle_identifiers=train_metadata.num_puzzle_identifiers,
-        causal=False  # Non-autoregressive
+        causal=False
     )
 
-    # Instantiate model with loss head
     model_cls = load_model_class(config.arch.name)
     loss_head_cls = load_model_class(config.arch.loss.name)
 
     with torch.device("cuda"):
         model: nn.Module = model_cls(model_cfg)
-        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)  # type: ignore
+        model = loss_head_cls(model, **config.arch.loss.__pydantic_extra__)
         if "DISABLE_COMPILE" not in os.environ:
-            model = torch.compile(model, dynamic=False)  # type: ignore
+            model = torch.compile(model, dynamic=False)
 
-        # Broadcast parameters from rank 0
         if world_size > 1:
             with torch.no_grad():
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
 
-    # Optimizers and lr
+    # --- 옵티마이저 설정 수정 ---
+    # 이제 옵티마이저는 AdamATan2 하나만 존재합니다.
     optimizers = [
-        CastedSparseEmbeddingSignSGD_Distributed(
-            model.model.puzzle_emb.buffers(),  # type: ignore
-            
-            lr=0,  # Needs to be set by scheduler
-            weight_decay=config.puzzle_emb_weight_decay,
-
-            world_size=world_size
-        ),
         AdamATan2(
             model.parameters(),
-
-            lr=0,  # Needs to be set by scheduler
+            lr=0,
             weight_decay=config.weight_decay,
             betas=(config.beta1, config.beta2)
         )
     ]
+    # 학습률 설정도 하나로 통일합니다.
     optimizer_lrs = [
-        config.puzzle_emb_lr,
         config.lr
     ]
 
     return model, optimizers, optimizer_lrs
+
 
 
 def cosine_schedule_with_warmup_lr_lambda(
@@ -393,32 +381,106 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
         set_ids = {k: idx for idx, k in enumerate(eval_metadata.sets)}
         
         all_preds = {}
+        arch_config = config.arch.__pydantic_extra__
 
         metric_keys = []
-        metric_values = None
+        metric_values_list = []
         
-        carry = None
         for set_name, batch, global_batch_size in eval_loader:
             batch = {k: v.cuda() for k, v in batch.items()}
             with torch.device("cuda"):
                 carry = train_state.model.initial_carry(batch)
 
             # 평가 시에는 max_steps까지 항상 실행
-            for _ in range(config.arch.halt_max_steps):
-                # 평가 로직은 학습보다 단순화: 가장 자신있는 모듈 선택, 1-step만 진행
+            for step in range(arch_config['halt_max_steps']):
+                carry.inner_carry = train_state.model.model.inner.reset_carry(carry.halted, carry.inner_carry)
+                carry.steps = torch.where(carry.halted, 0, carry.steps)
+                carry.current_data = {k: torch.where(carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in carry.current_data.items()}
+
                 num_modules = len(train_state.model.model.inner.reasoning_modules)
                 input_embeddings = train_state.model.model.inner._input_embeddings(carry.current_data["inputs"], carry.current_data["puzzle_identifiers"])
+                
                 predicted_errors = train_state.model.model.inner.thalamus_gate(input_embeddings[:, 0, :])[:, :num_modules]
                 chosen_module_idx = torch.argmin(predicted_errors, dim=1)[0].item()
 
-                # ... (train_batch와 유사한 1-step 추론 로직) ...
-                # 이 부분은 단순화를 위해 생략, 실제 구현 시 train_batch의 로직을 가져와 사용
+                z_states = carry.inner_carry.z_states
+                other_z_states = [z for i, z in enumerate(z_states) if i != chosen_module_idx]
+                other_z_sum = torch.stack(other_z_states, dim=0).sum(dim=0) if len(other_z_states) > 0 else 0
+                inactive_contrib = input_embeddings * (arch_config['max_modules'] - num_modules)
+                z_reason = other_z_sum + inactive_contrib
+
+                seq_info = dict(cos_sin=train_state.model.model.inner.rotary_emb() if hasattr(train_state.model.model.inner, "rotary_emb") else None)
+
+                z_active_next = z_states[chosen_module_idx]
+                for _ in range(arch_config['inner_loops']):
+                    module_input = z_active_next + z_reason
+                    z_active_next = train_state.model.model.inner.reasoning_modules[chosen_module_idx](module_input, **seq_info)
+                
+                final_active_signal = z_active_next
+                z_others_next = []
+                for i in range(num_modules):
+                    if i != chosen_module_idx:
+                        module_input = z_states[i] + final_active_signal
+                        z_others_next.append(train_state.model.model.inner.reasoning_modules[i](module_input, **seq_info))
+
+                carry.steps += 1
+                carry.halted = (carry.steps >= arch_config['halt_max_steps'])
+
+                carry.inner_carry.z_states[chosen_module_idx].copy_(final_active_signal)
+                other_idx_counter = 0
+                for i in range(num_modules):
+                    if i != chosen_module_idx:
+                        carry.inner_carry.z_states[i].copy_(z_others_next[other_idx_counter])
+                        other_idx_counter += 1
+
+                if carry.halted.all():
+                    break
             
             # 최종 결과로 메트릭 계산
-            # ... (메트릭 계산 로직) ...
+            puzzle_emb_len = arch_config.get('puzzle_emb_len', -(arch_config.get('puzzle_emb_ndim', 0) // -arch_config['hidden_size']))
+            final_logits = train_state.model.model.inner.lm_head(final_active_signal[:, puzzle_emb_len:, :])
+            labels = carry.current_data["labels"]
+            
+            mask = labels != IGNORE_LABEL_ID
+            loss_counts = mask.sum(-1)
+            
+            is_correct = mask & (torch.argmax(final_logits, dim=-1) == labels)
+            seq_is_correct = is_correct.sum(-1) == loss_counts
+            
+            metrics = {
+                "count": torch.tensor(loss_counts.shape[0], device="cuda"),
+                "accuracy": (is_correct.float().sum() / loss_counts.sum().clamp_min(1)),
+                "exact_accuracy": seq_is_correct.sum()
+            }
+            if not metric_keys:
+                metric_keys = sorted(metrics.keys())
+            metric_values_list.append(torch.stack([metrics[k] for k in metric_keys]))
 
-        # ... (기존 evaluate의 Reduce 및 로깅 로직) ...
-        pass # Placeholder
+            # 결과 저장
+            if len(config.eval_save_outputs):
+                preds = {"logits": final_logits}
+                for collection in (batch, preds):
+                    for k, v in collection.items():
+                        if k in config.eval_save_outputs:
+                            all_preds.setdefault(k, [])
+                            all_preds[k].append(v.cpu())
+        
+        if len(all_preds):
+            all_preds = {k: torch.cat(v, dim=0) for k, v in all_preds.items()}
+            os.makedirs(config.checkpoint_path, exist_ok=True)
+            torch.save(all_preds, os.path.join(config.checkpoint_path, f"step_{train_state.step}_all_preds.{rank}.pt"))
+
+        if metric_values_list:
+            metric_values = torch.stack(metric_values_list).sum(0)
+            if world_size > 1:
+                dist.reduce(metric_values, dst=0)
+            
+            if rank == 0:
+                metric_values = metric_values.cpu().numpy()
+                reduced_metrics = {k: metric_values[i] for i, k in enumerate(metric_keys)}
+                count = reduced_metrics.pop("count")
+                reduced_metrics = {f"eval/{k}": v / count for k, v in reduced_metrics.items()}
+                return reduced_metrics
 
 
 def save_code_and_config(config: PretrainConfig):
