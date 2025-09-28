@@ -5,6 +5,7 @@ import math
 import yaml
 import shutil
 from collections import deque
+from omegaconf import DictConfig, OmegaConf
 
 import torch
 import torch.distributed as dist
