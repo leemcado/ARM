@@ -193,7 +193,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
     # 배경 신호 계산 (사용자 제안 로직 + 기존 로직)
     other_z_sum = torch.sum(Z, dim=0) - Z_chosen
-    inactive_contrib = Z_chosen * (arch_config['max_modules'] - num_modules)
+    inactive_contrib = input_embeddings * (arch_config['max_modules'] - num_modules)
     z_reason = other_z_sum + inactive_contrib
     
     # 모든 샘플에 대한 최종 모듈 입력 계산
