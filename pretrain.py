@@ -148,6 +148,8 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         num_training_steps=train_state.total_steps,
         min_ratio=config.lr_min_ratio
     )
+# 파일: leemcado/arm/ARM-fc5fb9b222eec447e4c880b7b1df1c548614465a/pretrain.py
+
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
     train_state.step += 1
     if train_state.step > train_state.total_steps:
@@ -159,63 +161,78 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         with torch.device("cuda"):
             train_state.carry = train_state.model.initial_carry(batch)
 
-    # ACT 로직과 결합하여 carry 객체 업데이트
+    # ACT 로직 (기존과 동일)
     train_state.carry.inner_carry = train_state.model.model.inner.reset_carry(train_state.carry.halted, train_state.carry.inner_carry)
     train_state.carry.steps = torch.where(train_state.carry.halted, 0, train_state.carry.steps)
     train_state.carry.current_data = {k: torch.where(train_state.carry.halted.view((-1, ) + (1, ) * (batch[k].ndim - 1)), batch[k], v) for k, v in train_state.carry.current_data.items()}
 
-    # 순방향 계산 준비
+    # 준비 과정 (기존과 동일)
     num_modules = len(train_state.model.model.inner.reasoning_modules)
+    batch_size = batch['inputs'].shape[0]
+    device = batch['inputs'].device
     input_embeddings = train_state.model.model.inner._input_embeddings(train_state.carry.current_data["inputs"], train_state.carry.current_data.get("puzzle_identifiers"))
-
-    # '시상 게이트'의 예측은 그래디언트 추적이 필요함 (학습을 위해)
     predicted_errors = train_state.model.model.inner.thalamus_gate(input_embeddings[:, 0, :])[:, :num_modules]
 
-    # 'argmin'을 통한 모듈 선택은 그래디언트가 필요 없음
-    with torch.no_grad():
-        chosen_module_idx = torch.argmin(predicted_errors, dim=1)[0].item()
+    # --- ### 샘플별 라우팅 결정 (벡터화) ### ---
+    default_chosen_indices = torch.argmin(predicted_errors, dim=1)
+    chosen_module_indices = default_chosen_indices.clone()
 
-    # --- 강제 할당 단계인 경우, 라우팅 결정 덮어쓰기 ---
-    if train_state.is_in_forced_allocation_phase:
-        if num_modules > 1:
-            min_error_among_old_modules_per_sample = torch.min(predicted_errors[:, :-1], dim=1).values
-            max_of_min_errors = min_error_among_old_modules_per_sample.max().item()
-            if max_of_min_errors > train_state.hard_problem_threshold:
-                chosen_module_idx = num_modules - 1
+    if train_state.is_in_forced_allocation_phase and num_modules > 1:
+        min_error_among_old_modules_per_sample = torch.min(predicted_errors[:, :-1], dim=1).values
+        is_hard_problem_mask = min_error_among_old_modules_per_sample > train_state.hard_problem_threshold
+        new_module_idx = num_modules - 1
+        chosen_module_indices = torch.where(is_hard_problem_mask, new_module_idx, chosen_module_indices)
 
+    # --- ### 순방향 계산 최적화 (벡터화) ### ---
     z_states = train_state.carry.inner_carry.z_states
-    other_z_states = [z for i, z in enumerate(z_states) if i != chosen_module_idx]
-    other_z_sum = torch.stack(other_z_states, dim=0).sum(dim=0) if len(other_z_states) > 0 else 0
-    z_active = z_states[chosen_module_idx]
-    inactive_contrib = z_active * (arch_config['max_modules'] - num_modules)
+    Z = torch.stack(z_states, dim=0) # Shape: [M, B, S, H] (M: 모듈 수, B: 배치, S: 시퀀스, H: 히든)
+    
+    # 각 샘플에 대해 선택된 모듈의 z_state(z_i)를 gather로 한 번에 가져옴
+    gather_indices = chosen_module_indices.view(1, batch_size, 1, 1).expand(1, -1, Z.shape[2], Z.shape[3])
+    Z_chosen = torch.gather(Z, 0, gather_indices).squeeze(0) # Shape: [B, S, H]
+
+    # 배경 신호 계산 (사용자 제안 로직 + 기존 로직)
+    other_z_sum = torch.sum(Z, dim=0) - Z_chosen
+    inactive_contrib = Z_chosen * (arch_config['max_modules'] - num_modules)
     z_reason = other_z_sum + inactive_contrib
+    
+    # 모든 샘플에 대한 최종 모듈 입력 계산
+    module_input = Z_chosen + z_reason
 
     seq_info = dict(cos_sin=train_state.model.model.inner.rotary_emb() if hasattr(train_state.model.model.inner, "rotary_emb") else None)
-    
+
+    # 모든 모듈에 대해 전체 배치를 통과시켜 모든 가능한 출력을 계산
+    all_module_outputs_grad = torch.stack([
+        module.forward(module_input, **seq_info) for module in train_state.model.model.inner.reasoning_modules
+    ], dim=0) # Shape: [M, B, S, H]
+
+    # gather를 사용해 각 샘플에 해당하는 '올바른' 모듈의 출력을 선택
+    final_active_signal_grad = torch.gather(all_module_outputs_grad, 0, gather_indices).squeeze(0)
+
+    # 그래디언트가 필요 없는 연산도 동일하게 벡터화
     with torch.no_grad():
-        z_active_nograd = z_states[chosen_module_idx].clone()
-        for _ in range(arch_config['inner_loops']):
-            module_input = z_active_nograd + z_reason
-            z_active_nograd = train_state.model.model.inner.reasoning_modules[chosen_module_idx](module_input, **seq_info)
-        final_active_signal = z_active_nograd
-        z_others_nograd = []
-        for i in range(num_modules):
-            if i != chosen_module_idx:
-                module_input = z_states[i] + final_active_signal
-                z_others_nograd.append(train_state.model.model.inner.reasoning_modules[i](module_input, **seq_info))
+        all_module_outputs_nograd = torch.stack([
+            module.forward(module_input.detach(), **seq_info) for module in train_state.model.model.inner.reasoning_modules
+        ], dim=0)
+        final_active_signal_nograd = torch.gather(all_module_outputs_nograd, 0, gather_indices).squeeze(0)
 
-    z_active_grad = z_states[chosen_module_idx]
-    for _ in range(arch_config['inner_loops']):
-        module_input_grad = z_active_grad + z_reason
-        z_active_grad = train_state.model.model.inner.reasoning_modules[chosen_module_idx](module_input_grad, **seq_info)
-    final_active_signal_grad = z_active_grad
-    z_others_grad = []
-    for i in range(num_modules):
-        if i != chosen_module_idx:
-            module_input_grad = z_states[i] + final_active_signal_grad
-            z_others_grad.append(train_state.model.model.inner.reasoning_modules[i](module_input_grad, **seq_info))
+    # --- 모든 모듈의 최종 상태 계산 (벡터화) ---
+    # (z_k + 활성 모듈 출력)을 모든 모듈 k에 대해 한 번에 계산
+    next_z_input = Z + final_active_signal_grad.unsqueeze(0) # [M, B, S, H] + [1, B, S, H] -> 브로드캐스팅
+    
+    final_z_states_grad_stacked = torch.stack([
+        train_state.model.model.inner.reasoning_modules[i](next_z_input[i], **seq_info) for i in range(num_modules)
+    ], dim=0)
+    final_z_states_grad = [final_z_states_grad_stacked[i] for i in range(num_modules)]
 
-    final_z_states_grad = [final_active_signal_grad] + z_others_grad
+    with torch.no_grad():
+        next_z_input_nograd = Z.detach() + final_active_signal_nograd.unsqueeze(0)
+        final_z_states_nograd_stacked = torch.stack([
+            train_state.model.model.inner.reasoning_modules[i](next_z_input_nograd[i], **seq_info) for i in range(num_modules)
+        ], dim=0)
+        final_z_states_nograd = [final_z_states_nograd_stacked[i] for i in range(num_modules)]
+
+    # --- 이후 로직은 기존과 동일 ---
     seq_len = train_state.model.model.config.seq_len
     final_logits = [train_state.model.model.inner.lm_head(z[:, -seq_len:, :]) for z in final_z_states_grad]
     
@@ -236,7 +253,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     target_q_continue = None
     if train_state.model.training:
         with torch.no_grad():
-            next_q_logits = train_state.model.model.inner.q_head(final_active_signal.detach()[:, 0, :])
+            next_q_logits = train_state.model.model.inner.q_head(final_active_signal_nograd[:, 0, :])
             next_q_halt, next_q_continue = next_q_logits[..., 0], next_q_logits[..., 1]
             target_q_continue = torch.sigmoid(torch.where(is_last_step, next_q_halt, torch.maximum(next_q_halt, next_q_continue)))
 
@@ -246,19 +263,16 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         target_q_continue=target_q_continue
     )
     
-    predicted_error_for_chosen = predicted_errors[:, chosen_module_idx]
+    predicted_error_for_chosen = torch.gather(predicted_errors, 1, chosen_module_indices.unsqueeze(1)).squeeze(1)
     lm_loss = metrics.get('lm_loss', torch.tensor(0.0, device="cuda"))
     
-    # --- 최종 수정: 데이터 타입 일치 ---
-    # lm_loss를 predicted_error_for_chosen의 데이터 타입(BFloat16)으로 변환
     gating_loss = F.mse_loss(predicted_error_for_chosen, lm_loss.detach().to(predicted_error_for_chosen.dtype))
     
     total_loss = lm_q_loss + gating_loss
     
     total_loss.backward()
 
-    # --- 역전파 직후, 옵티마이저 실행 전 ---
-    # A. 상태 모니터링
+    # --- (역전파 이후 로직은 기존과 동일) ... ---
     all_grads = []
     for param in train_state.model.model.inner.thalamus_gate.parameters():
         if param.grad is not None:
@@ -269,7 +283,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     min_error_this_step = torch.min(predicted_errors).item()
     train_state.min_predicted_errors.append(min_error_this_step)
     
-    # B. 모듈 성장 상태 머신
     if train_state.is_in_forced_allocation_phase:
         train_state.forced_allocation_steps_left -= 1
         if train_state.forced_allocation_steps_left <= 0:
@@ -283,9 +296,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if train_state.model.model.inner.add_new_expert_module():
             train_state.is_in_forced_allocation_phase = True
             train_state.forced_allocation_steps_left = arch_config['forced_allocation_duration']
-            # 새 z_state를 carry에 추가
-            batch_size = batch['inputs'].shape[0]
-            new_z = torch.zeros(batch_size, train_state.model.model.config.seq_len, arch_config['hidden_size'], dtype=getattr(torch, train_state.model.model.config.forward_dtype), device="cuda")
+            new_z = torch.zeros(batch_size, train_state.model.model.config.seq_len, arch_config['hidden_size'], dtype=getattr(torch, train_state.model.model.config.forward_dtype), device=device)
             train_state.carry.inner_carry.z_states.append(new_z)
         
         train_state.system_converged = False
@@ -296,7 +307,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             if rank == 0:
                 print(f"Step {train_state.step}: System converged with avg grad variance {avg_grad_variance:.2E}")
     
-    # 옵티마이저 스텝
     if world_size > 1:
         for param in train_state.model.parameters():
             if param.grad is not None:
@@ -313,12 +323,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         optim.zero_grad()
 
     with torch.no_grad():
-        train_state.carry.inner_carry.z_states[chosen_module_idx].copy_(final_active_signal)
-        other_idx_counter = 0
-        for i in range(num_modules):
-            if i != chosen_module_idx:
-                train_state.carry.inner_carry.z_states[i].copy_(z_others_nograd[other_idx_counter])
-                other_idx_counter += 1
+        train_state.carry.inner_carry.z_states = final_z_states_nograd
     
     if len(metrics) > 0:
         metric_keys = list(sorted(metrics.keys()))
@@ -333,7 +338,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             reduced_metrics = {f"train/{k}": v / (global_batch_size if k.endswith("loss") else count) for k, v in reduced_metrics.items()}
             reduced_metrics["train/gating_loss"] = gating_loss.item() / global_batch_size
             reduced_metrics["train/lr"] = lr_this_step
-            # C. WandB 로깅
             reduced_metrics["train/current_module_count"] = num_modules
             reduced_metrics["train/min_predicted_error"] = min_error_this_step
             reduced_metrics["train/hard_problem_threshold"] = train_state.hard_problem_threshold
