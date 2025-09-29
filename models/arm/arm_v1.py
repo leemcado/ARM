@@ -52,8 +52,13 @@ class ARMBlock(nn.Module):
         self.norm_eps = config.rms_norm_eps
 
     def forward(self, cos_sin: CosSin, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = rms_norm(hidden_states + self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states), variance_epsilon=self.norm_eps)
-        hidden_states = rms_norm(hidden_states + self.mlp(hidden_states), variance_epsilon=self.norm_eps)
+        # 1. 어텐션 출력(F(z))을 먼저 계산하고 정규화한 후, 입력(z)에 더합니다.
+        attn_output = self.self_attn(cos_sin=cos_sin, hidden_states=hidden_states)
+        hidden_states = hidden_states + rms_norm(attn_output, variance_epsilon=self.norm_eps)
+
+        # 2. MLP 출력(F(z))을 먼저 계산하고 정규화한 후, 입력(z)에 더합니다.
+        mlp_output = self.mlp(hidden_states)
+        hidden_states = hidden_states + rms_norm(mlp_output, variance_epsilon=self.norm_eps)
         return hidden_states
 
 

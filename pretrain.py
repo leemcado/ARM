@@ -186,7 +186,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     z_states = train_state.carry.inner_carry.z_states
     other_z_states = [z for i, z in enumerate(z_states) if i != chosen_module_idx]
     other_z_sum = torch.stack(other_z_states, dim=0).sum(dim=0) if len(other_z_states) > 0 else 0
-    inactive_contrib = input_embeddings * (arch_config['max_modules'] - num_modules)
+    z_active = z_states[chosen_module_idx]
+    inactive_contrib = z_active * (arch_config['max_modules'] - num_modules)
     z_reason = other_z_sum + inactive_contrib
 
     seq_info = dict(cos_sin=train_state.model.model.inner.rotary_emb() if hasattr(train_state.model.model.inner, "rotary_emb") else None)
