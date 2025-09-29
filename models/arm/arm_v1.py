@@ -66,7 +66,13 @@ class ARMReasoningModule(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states, **kwargs)
         return hidden_states
+class RMSNorm(nn.Module):
+    def __init__(self, variance_epsilon: float = 1e-6):
+        super().__init__()
+        self.variance_epsilon = variance_epsilon
 
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return rms_norm(hidden_states, self.variance_epsilon)
 
 @dataclass
 class ARMInnerCarry:
@@ -106,7 +112,9 @@ class ARM_Inner(nn.Module):
         self.thalamus_gate = nn.Sequential(
             CastedLinear(self.config.hidden_size, self.config.hidden_size, bias=True),
             nn.ReLU(),
-            CastedLinear(self.config.hidden_size, self.config.max_modules, bias=True)
+            RMSNorm(variance_epsilon=1e-2), 
+            CastedLinear(self.config.hidden_size, self.config.max_modules, bias=True),
+            RMSNorm(variance_epsilon=1e-2)
         )
 
     # --- _input_embeddings 메소드 수정 ---
