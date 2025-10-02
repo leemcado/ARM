@@ -136,9 +136,9 @@ class ARM_Inner(nn.Module):
             new_module = ARMReasoningModule(
                 layers=[ARMBlock(self.config) for _ in range(self.config.reasoning_layers)]
             )
-            with torch.no_grad():
-                for param in new_module.parameters():
-                    trunc_normal_init_(param, std=1e-5)
+            # with torch.no_grad():
+            #     for param in new_module.parameters():
+            #         trunc_normal_init_(param, std=1e-5)
             device = next(self.parameters()).device
             self.reasoning_modules.append(new_module.to(device))
             print(f"New expert module added. Total modules: {len(self.reasoning_modules)}")

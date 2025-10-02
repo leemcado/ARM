@@ -15,7 +15,7 @@ inner_loops: 4 # 활성 모듈의 내부 반복 추론 횟수
 
 # --- 새로운 성장 메커니즘을 위한 하이퍼파라미터 ---
 convergence_check_interval: 1000 # 수렴 상태를 확인할 주기 (훈련 스텝 단위)
-stable_threshold: 5e-2         # 그래디언트 분산이 이 값보다 낮으면 수렴으로 판단
+stable_threshold: 1e-4         # 그래디언트 분산이 이 값보다 낮으면 수렴으로 판단
 rate_hardprob: 0.25              # 상위 15%의 문제를 난제로 정의 (0.15 = 5%)
 forced_allocation_duration: 1000 # 새 모듈 추가 후 난제를 강제 할당할 기간 (훈련 스텝 단위)
 

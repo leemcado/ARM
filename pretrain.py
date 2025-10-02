@@ -216,22 +216,33 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         ], dim=0)
         final_active_signal_nograd = torch.gather(all_module_outputs_nograd, 0, gather_indices).squeeze(0)
 
-    # --- 모든 모듈의 최종 상태 계산 (벡터화) ---
-    # (z_k + 활성 모듈 출력)을 모든 모듈 k에 대해 한 번에 계산
-    next_z_input = Z + final_active_signal_grad.unsqueeze(0) # [M, B, S, H] + [1, B, S, H] -> 브로드캐스팅
+    # --- ### 최종 상태 계산 로직 수정 (활성/비활성 업데이트 분리) ### ---
+
+    # 1. 모든 다음 상태(z_next)를 일단 현재 상태(z_current)로 초기화합니다.
+    #    이렇게 하면 비활성 모듈은 기본적으로 상태가 유지되어 전문성이 보존됩니다.
+    final_z_states_grad = list(z_states)  # 현재 상태 리스트를 복사
+    final_z_states_nograd = [z.detach().clone() for z in z_states]
+
+    # 2. '활성 모듈'의 다음 상태만 특별히 계산하여 덮어씁니다.
+    #    이는 안정적인 '닫힌 순환계'를 형성하여 깊이 있는 추론을 가능하게 합니다.
+    chosen_idx = chosen_module_indices[0].item() # 현재 배치에서 선택된 모듈의 인덱스
+
+    # 그래디언트가 흐르는 연산 (학습용)
+    active_z_next_grad = final_active_signal_grad # 이전 단계의 활성 모듈 출력을 초기 입력으로 사용
+    for _ in range(arch_config['inner_loops']):
+        # 자기 자신의 이전 출력을 입력으로 받아 순환적으로 추론
+        active_z_next_grad = train_state.model.model.inner.reasoning_modules[chosen_idx](active_z_next_grad, **seq_info)
     
-    final_z_states_grad_stacked = torch.stack([
-        train_state.model.model.inner.reasoning_modules[i](next_z_input[i], **seq_info) for i in range(num_modules)
-    ], dim=0)
-    final_z_states_grad = [final_z_states_grad_stacked[i] for i in range(num_modules)]
+    # final_z_states_grad 리스트에서 활성 모듈의 위치에만 계산된 새 상태를 덮어씁니다.
+    final_z_states_grad[chosen_idx] = active_z_next_grad
 
+    # 그래디언트가 흐르지 않는 연산 (다음 스텝의 carry 상태 전달용)
     with torch.no_grad():
-        next_z_input_nograd = Z.detach() + final_active_signal_nograd.unsqueeze(0)
-        final_z_states_nograd_stacked = torch.stack([
-            train_state.model.model.inner.reasoning_modules[i](next_z_input_nograd[i], **seq_info) for i in range(num_modules)
-        ], dim=0)
-        final_z_states_nograd = [final_z_states_nograd_stacked[i] for i in range(num_modules)]
-
+        active_z_next_nograd = final_active_signal_nograd
+        for _ in range(arch_config['inner_loops']):
+            active_z_next_nograd = train_state.model.model.inner.reasoning_modules[chosen_idx](active_z_next_nograd, **seq_info)
+        
+        final_z_states_nograd[chosen_idx] = active_z_next_nograd
     # --- 이후 로직은 기존과 동일 ---
     seq_len = train_state.model.model.config.seq_len
     final_logits = [train_state.model.model.inner.lm_head(z[:, -seq_len:, :]) for z in final_z_states_grad]
@@ -298,6 +309,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             train_state.forced_allocation_steps_left = arch_config['forced_allocation_duration']
             new_z = torch.zeros(batch_size, train_state.model.model.config.seq_len, arch_config['hidden_size'], dtype=getattr(torch, train_state.model.model.config.forward_dtype), device=device)
             train_state.carry.inner_carry.z_states.append(new_z)
+            final_z_states_nograd.append(new_z)
         
         train_state.system_converged = False
     elif train_state.step % arch_config['convergence_check_interval'] == 0 and len(train_state.gating_grad_variances) > 0:
@@ -366,6 +378,13 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                 other_z_sum = torch.stack(other_z_states, dim=0).sum(dim=0) if len(other_z_states) > 0 else 0
                 inactive_contrib = input_embeddings * (arch_config['max_modules'] - num_modules)
                 z_reason = other_z_sum + inactive_contrib
+                if train_state.is_in_forced_allocation_phase and num_modules > 1:
+                    new_module_idx = num_modules - 1
+                    # 각 샘플별로 새 모듈이 선택되었는지 여부를 나타내는 마스크 생성
+                    is_new_module_chosen_mask = (chosen_module_indices == new_module_idx).view(-1, 1, 1)
+                    
+                    # 새 모듈이 선택된 샘플에 대해서는 z_reason에서 other_z_sum을 빼서 간섭을 제거
+                    z_reason = torch.where(is_new_module_chosen_mask, z_reason - other_z_sum, z_reason)
                 seq_info = dict(cos_sin=train_state.model.model.inner.rotary_emb() if hasattr(train_state.model.model.inner, "rotary_emb") else None)
                 z_active_next = z_states[chosen_module_idx]
                 for _ in range(arch_config['inner_loops']):
