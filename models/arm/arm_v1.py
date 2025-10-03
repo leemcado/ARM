@@ -206,9 +206,11 @@ class ARM(nn.Module):
         z_f = torch.zeros(batch_size, self.config.seq_len, self.config.frontal_module.hidden_size, 
                           dtype=getattr(torch, self.config.forward_dtype), device="cuda")
         
+        # BUG FIX: 초기 모듈 개수가 아닌, 현재 활성화된 실제 모듈 개수만큼 z_r_states를 생성
+        num_current_modules = len(self.inner.reasoning_modules)
         z_r_states = [torch.zeros(batch_size, self.config.seq_len, self.config.reasoning_module.hidden_size, 
                                   dtype=getattr(torch, self.config.forward_dtype), device="cuda")
-                      for _ in range(self.config.initial_modules)]
+                      for _ in range(num_current_modules)]
         
         inner_carry = ARMInnerCarry(z_f=z_f, z_r_states=z_r_states)
 
