@@ -73,7 +73,7 @@ class TrainState:
     system_converged: bool = False
     is_in_stabilization_phase: bool = False
     stabilization_steps_left: int = 0
-    module_activation_counts: List[int]
+    module_activation_counts: List[int] = field(default_factory=list)
 
 # --- 유틸리티 함수 ---
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -275,6 +275,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if train_state.stabilization_steps_left <= 0:
             train_state.is_in_stabilization_phase = False
             train_state.system_converged = False 
+            train_state.gating_grad_variances.clear()
             if rank == 0: print(f"\nStep {train_state.step}: Stabilization phase finished.")
     
     elif num_modules < arch_config['max_modules'] and train_state.step > 0 and train_state.step % arch_config['convergence_check_interval'] == 0:
@@ -405,13 +406,9 @@ def evaluate(config: PretrainConfig, model: nn.Module, eval_loader: torch.utils.
         return final_metrics
     return None
 
-def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_state_dict: Dict[str, torch.Tensor], step: int, epoch: int, run_id: str):
+def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_state_dict: Dict[str, torch.Tensor], step: int, epoch: int, metrics_queue: mp.Queue):
     if "LOCAL_RANK" not in os.environ:
         torch.cuda.set_device(rank)
-
-    if rank == 0:
-        # BUG FIX: Timeout을 방지하기 위해 init_timeout 설정 추가
-        wandb.init(project=config.project_name, id=run_id, resume="must", settings=wandb.Settings(init_timeout=600))
     
     _, eval_metadata = create_dataloader(config, "test", rank=rank, world_size=world_size)
     eval_loader, _ = create_dataloader(config, "test", rank=rank, world_size=world_size) 
@@ -422,12 +419,8 @@ def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_st
     eval_metrics = evaluate(config, model, eval_loader, eval_metadata, rank=rank, world_size=world_size)
     
     if rank == 0 and eval_metrics is not None:
-        eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
-        wandb.log(eval_metrics_with_epoch, step=step)
-        print(f"Evaluation at epoch {epoch} finished. Metrics: {eval_metrics}")
-    
-    if wandb.run:
-        wandb.finish()
+        # wandb 로깅 대신 Queue에 결과를 넣음
+        metrics_queue.put((step, epoch, eval_metrics))
 
 
 def rank_zero_only():
@@ -481,22 +474,29 @@ def launch(hydra_config: DictConfig):
 
     progress_bar = None
     eval_process = None
-    run_id = None
+    metrics_queue = None
 
     steps_per_epoch = int(train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
     if rank_zero_only():
         progress_bar = tqdm.tqdm(total=train_state.total_steps, desc="Training")
-        run = wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump())
-        run_id = run.id 
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump())
         wandb.watch(train_state.model, log_freq=100)
         wandb.log({"num_params": sum(p.numel() for p in train_state.model.parameters())}, step=0)
         save_code_and_config(config, hydra_config)
+        metrics_queue = mp.Queue()
 
     train_state.model.train()
     for _, batch, global_batch_size_effective in train_loader:
         if train_state.step >= train_state.total_steps: break
         
+        # 메인 프로세스에서 Queue를 확인하고 결과가 있으면 로깅
+        if RANK == 0 and not metrics_queue.empty():
+            step, epoch, eval_metrics = metrics_queue.get()
+            eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
+            wandb.log(eval_metrics_with_epoch, step=step)
+            print(f"Evaluation results from epoch {epoch} logged.")
+
         metrics = train_batch(config, train_state, batch, global_batch_size_effective, rank=RANK, world_size=WORLD_SIZE)
         
         current_epoch = (train_state.step -1) // steps_per_epoch + 1
@@ -514,7 +514,7 @@ def launch(hydra_config: DictConfig):
             model_state_cpu = {k: v.cpu() for k, v in train_state.model.state_dict().items()}
 
             eval_process = mp.Process(target=evaluate_worker, args=(
-                RANK, WORLD_SIZE, config, model_state_cpu, train_state.step, current_epoch, run_id
+                RANK, WORLD_SIZE, config, model_state_cpu, train_state.step, current_epoch, metrics_queue
             ))
             eval_process.start()
             
@@ -523,6 +523,12 @@ def launch(hydra_config: DictConfig):
     
     if rank_zero_only():
         progress_bar.close()
+        # 마지막으로 큐에 남아있는 결과 처리
+        while not metrics_queue.empty():
+            step, epoch, eval_metrics = metrics_queue.get()
+            eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
+            wandb.log(eval_metrics_with_epoch, step=step)
+            print(f"Final evaluation results from epoch {epoch} logged.")
         save_train_state(config, train_state)
     
     if eval_process is not None:
