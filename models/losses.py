@@ -132,9 +132,18 @@ class ARMLossHead(nn.Module):
 
         q_halt_loss = F.binary_cross_entropy_with_logits(q_halt_logits, seq_is_correct.to(q_halt_logits.dtype), reduction="sum")
         
-        q_continue_loss = torch.tensor(0.0, device=q_halt_logits.device)
+        # BUG FIX: q_continue_loss가 계산되지 않는 문제 수정
+        # target_q_continue가 명시적으로 주어지지 않으면, 아직 중단(halt)되지 않은 샘플에 대해
+        # '계속(continue)'하도록 학습하는 것을 기본 동작으로 설정합니다.
+        # 이상적인 '계속'의 타겟은 '~carry.halted' (중단되지 않음) 입니다.
         if target_q_continue is not None:
+            # 외부에서 타겟을 제공한 경우
             q_continue_loss = F.binary_cross_entropy_with_logits(q_continue_logits, target_q_continue, reduction="sum")
+        else:
+            # 기본 동작: 아직 중단되지 않은 시퀀스는 계속하도록 학습
+            # `carry.halted`는 bool 타입이므로 float 타입으로 변환해야 함
+            continue_target = (~carry.halted).to(q_continue_logits.dtype)
+            q_continue_loss = F.binary_cross_entropy_with_logits(q_continue_logits, continue_target, reduction="sum")
 
         metrics.update({
             "lm_loss": total_lm_loss.detach(),

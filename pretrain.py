@@ -183,11 +183,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     active_module_idx = torch.argmin(predicted_errors, dim=1) 
     if train_state.is_in_stabilization_phase and num_modules > 1:
         with torch.no_grad():
-            difficulty = torch.min(predicted_errors[:, :-1], dim=1).values
-            is_hard_mask = difficulty > train_state.hard_problem_threshold
-            new_module_idx = num_modules - 1
-            active_module_idx = torch.where(is_hard_mask, new_module_idx, active_module_idx)
+            # BUG FIX: 안정화 단계 로직 수정
+            # 1. '기존' 모듈들 중에서만 최적의 모듈을 먼저 선택합니다.
+            #    이렇게 하면 아직 학습되지 않은 새 모듈이 '쉬운' 문제에 할당되는 것을 원천 차단합니다.
+            existing_module_errors = predicted_errors[:, :-1]
+            active_module_idx_among_existing = torch.argmin(existing_module_errors, dim=1)
 
+            # 2. 기존 모듈들이 느끼는 문제의 난이도를 계산합니다.
+            difficulty = torch.min(existing_module_errors, dim=1).values
+            is_hard_mask = difficulty > train_state.hard_problem_threshold
+            
+            # 3. '고난도' 문제일 경우에만 새 모듈로 강제 할당하고,
+            #    그렇지 않은 모든 경우에는 '기존' 모듈 중 최적 모듈을 사용하도록 명시합니다.
+            new_module_idx = num_modules - 1
+            active_module_idx = torch.where(is_hard_mask, new_module_idx, active_module_idx_among_existing)
+            
     if config.verbose > 0:
         unique_indices, counts = torch.unique(active_module_idx, return_counts=True)
         for idx, count in zip(unique_indices.tolist(), counts.tolist()):
@@ -405,7 +415,6 @@ def evaluate(config: PretrainConfig, model: nn.Module, eval_loader: torch.utils.
         final_metrics = {f"eval/{k}": v / count for k, v in total_metrics.items()}
         return final_metrics
     return None
-
 def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_state_dict: Dict[str, torch.Tensor], step: int, epoch: int, metrics_queue: mp.Queue):
     if "LOCAL_RANK" not in os.environ:
         torch.cuda.set_device(rank)
@@ -414,14 +423,32 @@ def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_st
     eval_loader, _ = create_dataloader(config, "test", rank=rank, world_size=world_size) 
     
     model, _, _ = create_model(config, eval_metadata, world_size)
-    model.load_state_dict(model_state_dict)
+
+    # BUG FIX: 동적으로 추가된 모듈 수를 state_dict에서 파악하여 평가 모델에 반영
+    # 1. '_orig_mod.' 접두사 제거 (torch.compile로 인해 발생)
+    clean_state_dict = {k.removeprefix("_orig_mod."): v for k, v in model_state_dict.items()}
+
+    # 2. state_dict의 키를 분석하여 훈련된 모델의 추론 모듈 개수 파악
+    trained_module_keys = [k for k in clean_state_dict.keys() if k.startswith("model.inner.reasoning_modules.")]
+    if trained_module_keys:
+        max_trained_module_idx = max([int(k.split('.')[3]) for k in trained_module_keys])
+        num_trained_modules = max_trained_module_idx + 1
+    else:
+        num_trained_modules = config.arch.__pydantic_extra__.get('initial_modules', 1)
+
+    # 3. 현재 평가 모델의 모듈 개수와 맞을 때까지 새로운 모듈 추가
+    eval_model_unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+    while len(eval_model_unwrapped.model.inner.reasoning_modules) < num_trained_modules:
+        eval_model_unwrapped.model.inner.add_new_reasoning_module()
+
+    # 4. 정리된 state_dict를 로드
+    model.load_state_dict(clean_state_dict, strict=True)
 
     eval_metrics = evaluate(config, model, eval_loader, eval_metadata, rank=rank, world_size=world_size)
     
     if rank == 0 and eval_metrics is not None:
         # wandb 로깅 대신 Queue에 결과를 넣음
         metrics_queue.put((step, epoch, eval_metrics))
-
 
 def rank_zero_only():
     return not dist.is_initialized() or dist.get_rank() == 0
