@@ -180,24 +180,27 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     with torch.no_grad():
         min_predicted_error_this_step = torch.min(predicted_errors).item()
 
-    active_module_idx = torch.argmin(predicted_errors, dim=1) 
+    active_module_idx = torch.argmin(predicted_errors, dim=1)
     if train_state.is_in_stabilization_phase and num_modules > 1:
         with torch.no_grad():
-            # BUG FIX: 안정화 단계 로직 수정
-            # 1. '기존' 모듈들 중에서만 최적의 모듈을 먼저 선택합니다.
-            #    이렇게 하면 아직 학습되지 않은 새 모듈이 '쉬운' 문제에 할당되는 것을 원천 차단합니다.
+            # BUG FIX: 고정된 과거 임계값이 아닌, 현재 배치 내의 상대적 난이도를 사용하도록 수정
+            arch_config = config.arch.__pydantic_extra__
+            
+            # 1. 새 모듈을 제외한 '기존 모듈'들의 예측 오류만 추출
             existing_module_errors = predicted_errors[:, :-1]
             active_module_idx_among_existing = torch.argmin(existing_module_errors, dim=1)
 
-            # 2. 기존 모듈들이 느끼는 문제의 난이도를 계산합니다.
+            # 2. 기존 모듈 기준으로 현재 배치의 샘플별 난이도를 계산
             difficulty = torch.min(existing_module_errors, dim=1).values
-            is_hard_mask = difficulty > train_state.hard_problem_threshold
             
-            # 3. '고난도' 문제일 경우에만 새 모듈로 강제 할당하고,
-            #    그렇지 않은 모든 경우에는 '기존' 모듈 중 최적 모듈을 사용하도록 명시합니다.
+            # 3. '현재 배치'의 난이도 분포를 보고, 상위 N%에 해당하는 '동적 임계값'을 계산
+            #    (예: rate_hardprob=0.15이면, 상위 15%를 고난도로 분류하는 임계값을 매번 새로 찾음)
+            batch_threshold = torch.quantile(difficulty, 1 - arch_config['rate_hardprob'])
+            is_hard_mask = difficulty > batch_threshold
+            
+            # 4. 이 동적 임계값을 기준으로 고난도 문제를 새 모듈에 할당
             new_module_idx = num_modules - 1
             active_module_idx = torch.where(is_hard_mask, new_module_idx, active_module_idx_among_existing)
-            
     if config.verbose > 0:
         unique_indices, counts = torch.unique(active_module_idx, return_counts=True)
         for idx, count in zip(unique_indices.tolist(), counts.tolist()):
@@ -424,25 +427,27 @@ def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_st
     
     model, _, _ = create_model(config, eval_metadata, world_size)
 
-    # BUG FIX: 동적으로 추가된 모듈 수를 state_dict에서 파악하여 평가 모델에 반영
-    # 1. '_orig_mod.' 접두사 제거 (torch.compile로 인해 발생)
-    clean_state_dict = {k.removeprefix("_orig_mod."): v for k, v in model_state_dict.items()}
-
-    # 2. state_dict의 키를 분석하여 훈련된 모델의 추론 모듈 개수 파악
-    trained_module_keys = [k for k in clean_state_dict.keys() if k.startswith("model.inner.reasoning_modules.")]
+    # BUG FIX: torch.compile로 인한 state_dict 키 불일치 문제 해결
+    # 1. state_dict의 키를 분석하여 훈련된 모델의 추론 모듈 개수 파악
+    #    '_orig_mod.' 접두사를 제거하지 않고, 접두사가 붙은 상태에서 키를 분석합니다.
+    prefix = "_orig_mod.model.inner.reasoning_modules."
+    trained_module_keys = [k for k in model_state_dict.keys() if k.startswith(prefix)]
     if trained_module_keys:
-        max_trained_module_idx = max([int(k.split('.')[3]) for k in trained_module_keys])
+        # e.g., key: '_orig_mod.model.inner.reasoning_modules.1.layers.0...' -> '1' 추출
+        max_trained_module_idx = max([int(k.split('.')[4]) for k in trained_module_keys])
         num_trained_modules = max_trained_module_idx + 1
     else:
         num_trained_modules = config.arch.__pydantic_extra__.get('initial_modules', 1)
 
-    # 3. 현재 평가 모델의 모듈 개수와 맞을 때까지 새로운 모듈 추가
+    # 2. 현재 평가 모델의 모듈 개수와 맞을 때까지 새로운 모듈 추가
+    #    모듈을 추가하기 위해 컴파일된 모델을 unwrap합니다.
     eval_model_unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
     while len(eval_model_unwrapped.model.inner.reasoning_modules) < num_trained_modules:
         eval_model_unwrapped.model.inner.add_new_reasoning_module()
 
-    # 4. 정리된 state_dict를 로드
-    model.load_state_dict(clean_state_dict, strict=True)
+    # 3. 원본 state_dict를 컴파일된 평가 모델에 그대로 로드합니다.
+    #    접두사를 제거하지 않으므로 키가 일치하게 됩니다.
+    model.load_state_dict(model_state_dict, strict=True)
 
     eval_metrics = evaluate(config, model, eval_loader, eval_metadata, rank=rank, world_size=world_size)
     
