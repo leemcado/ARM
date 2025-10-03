@@ -73,6 +73,8 @@ class TrainState:
     system_converged: bool = False
     is_in_stabilization_phase: bool = False
     stabilization_steps_left: int = 0
+    is_in_adaptive_phase: bool = False
+    adaptive_steps_left: int = 0
     module_activation_counts: List[int] = field(default_factory=list)
 
 # --- 유틸리티 함수 ---
@@ -130,7 +132,21 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             with torch.no_grad():
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
-    optimizers = [AdamATan2(model.parameters(), lr=0, weight_decay=config.weight_decay, betas=(config.beta1, config.beta2))]
+    
+    # BUG FIX: 전두엽 모듈의 학습률을 독립적으로 제어하기 위해 파라미터 그룹 분리
+    model_unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
+    
+    frontal_params = list(model_unwrapped.model.inner.frontal_module.parameters())
+    frontal_param_ids = {id(p) for p in frontal_params}
+    
+    other_params = [p for p in model.parameters() if id(p) not in frontal_param_ids]
+    
+    param_groups = [
+        {'params': frontal_params, 'name': 'frontal_module'},
+        {'params': other_params, 'name': 'other_modules'}
+    ]
+    
+    optimizers = [AdamATan2(param_groups, lr=0, weight_decay=config.weight_decay, betas=(config.beta1, config.beta2))]
     optimizer_lrs = [config.lr]
     return model, optimizers, optimizer_lrs
 
@@ -178,29 +194,48 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     predicted_errors = train_state.model.model.inner.thalamus_module(z_f_t, input_embeddings)[:, :num_modules]
     
     with torch.no_grad():
-        min_predicted_error_this_step = torch.min(predicted_errors).item()
+        if train_state.is_in_stabilization_phase:
+            min_predicted_error_this_step = torch.min(predicted_errors[:, :-1]).item()
+        else:
+            min_predicted_error_this_step = torch.min(predicted_errors).item()
 
-    active_module_idx = torch.argmin(predicted_errors, dim=1)
-    if train_state.is_in_stabilization_phase and num_modules > 1:
+    # BUG FIX: 시상 모듈의 편견 학습을 막기 위한 '적응 학습' 단계 도입
+    if train_state.is_in_adaptive_phase and num_modules > 1:
         with torch.no_grad():
-            # BUG FIX: 고정된 과거 임계값이 아닌, 현재 배치 내의 상대적 난이도를 사용하도록 수정
-            arch_config = config.arch.__pydantic_extra__
+            # '적응 학습' 단계: 탐험(Exploration)과 신뢰 보너스(Bonus) 적용
+            adaptive_config = arch_config['adaptive_learning']
             
-            # 1. 새 모듈을 제외한 '기존 모듈'들의 예측 오류만 추출
+            # 1. 가장 최근에 생성된 모듈에 '신뢰 보너스'를 부여하여 선택 확률을 높임
+            predicted_errors_with_bonus = predicted_errors.clone()
+            predicted_errors_with_bonus[:, -1] += adaptive_config['new_module_bonus']
+            
+            # 2. 보너스가 적용된 점수를 기준으로 최적의 모듈을 선택
+            best_module_idx = torch.argmin(predicted_errors_with_bonus, dim=1)
+            
+            # 3. 일정 확률로 무작위 탐험을 수행하여 새로운 가능성을 발견
+            explore_mask = torch.rand(best_module_idx.shape[0], device=device) < adaptive_config['exploration_prob']
+            random_module_idx = torch.randint(0, num_modules, best_module_idx.shape, device=device)
+            
+            active_module_idx = torch.where(explore_mask, random_module_idx, best_module_idx)
+
+    elif train_state.is_in_stabilization_phase and num_modules > 1:
+        with torch.no_grad():
+            # '안정화 학습' 단계: 고난도 문제 강제 할당 (정렬 기반)
             existing_module_errors = predicted_errors[:, :-1]
             active_module_idx_among_existing = torch.argmin(existing_module_errors, dim=1)
 
-            # 2. 기존 모듈 기준으로 현재 배치의 샘플별 난이도를 계산
             difficulty = torch.min(existing_module_errors, dim=1).values
+            sorted_indices = torch.argsort(difficulty, descending=True)
+            num_hard_problems = int(len(difficulty) * arch_config['rate_hardprob'])
+            hard_problem_indices = sorted_indices[:num_hard_problems]
             
-            # 3. '현재 배치'의 난이도 분포를 보고, 상위 N%에 해당하는 '동적 임계값'을 계산
-            #    (예: rate_hardprob=0.15이면, 상위 15%를 고난도로 분류하는 임계값을 매번 새로 찾음)
-            batch_threshold = torch.quantile(difficulty, 1 - arch_config['rate_hardprob'])
-            is_hard_mask = difficulty > batch_threshold
-            
-            # 4. 이 동적 임계값을 기준으로 고난도 문제를 새 모듈에 할당
             new_module_idx = num_modules - 1
-            active_module_idx = torch.where(is_hard_mask, new_module_idx, active_module_idx_among_existing)
+            active_module_idx = active_module_idx_among_existing
+            active_module_idx[hard_problem_indices] = new_module_idx
+    else:
+        # 일반 학습 단계: 가장 예측 오류가 낮은 모듈을 선택
+        active_module_idx = torch.argmin(predicted_errors, dim=1)
+
     if config.verbose > 0:
         unique_indices, counts = torch.unique(active_module_idx, return_counts=True)
         for idx, count in zip(unique_indices.tolist(), counts.tolist()):
@@ -241,10 +276,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         halted = is_last_step | (q_halt_logits > q_continue_logits)
         min_halt_steps = (torch.rand_like(q_halt_logits) < arch_config['halt_exploration_prob']) * torch.randint_like(current_carry.steps, low=2, high=arch_config['halt_max_steps'] + 1)
         current_carry.halted = halted & (current_carry.steps >= min_halt_steps)
-    
-    freeze_frontal = train_state.is_in_stabilization_phase and (num_modules -1) in active_module_idx
-    if freeze_frontal:
-        for param in train_state.model.model.inner.frontal_module.parameters(): param.requires_grad_(False)
 
     lm_q_loss, metrics, lm_loss_per_seq = train_state.model(
         carry=current_carry, final_logits=final_logits, q_halt_logits=q_halt_logits, q_continue_logits=q_continue_logits
@@ -263,9 +294,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             current_grad_variance = torch.var(torch.cat([g.view(-1) for g in gate_grads])).item()
             train_state.gating_grad_variances.append(current_grad_variance)
 
-    if freeze_frontal:
-        for param in train_state.model.model.inner.frontal_module.parameters(): param.requires_grad_(True)
-            
     if world_size > 1:
         for param in train_state.model.parameters():
             if param.grad is not None: dist.all_reduce(param.grad)
@@ -273,7 +301,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     lr_this_step = None
     for optim, base_lr in zip(train_state.optimizers, train_state.optimizer_lrs):
         lr_this_step = compute_lr(base_lr, config, train_state)
-        for param_group in optim.param_groups: param_group['lr'] = lr_this_step
+        
+        soft_update_frontal = train_state.is_in_stabilization_phase and (num_modules - 1) in active_module_idx
+
+        for param_group in optim.param_groups:
+            if param_group['name'] == 'frontal_module' and soft_update_frontal:
+                param_group['lr'] = lr_this_step * 0.01
+            else:
+                param_group['lr'] = lr_this_step
+                
         optim.step()
         optim.zero_grad()
 
@@ -289,9 +325,19 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             train_state.is_in_stabilization_phase = False
             train_state.system_converged = False 
             train_state.gating_grad_variances.clear()
-            if rank == 0: print(f"\nStep {train_state.step}: Stabilization phase finished.")
-    
-    elif num_modules < arch_config['max_modules'] and train_state.step > 0 and train_state.step % arch_config['convergence_check_interval'] == 0:
+            
+            adaptive_config = arch_config['adaptive_learning']
+            train_state.is_in_adaptive_phase = True
+            train_state.adaptive_steps_left = adaptive_config['duration']
+            if rank == 0: print(f"\nStep {train_state.step}: Stabilization phase finished. Starting Adaptive Learning phase for {adaptive_config['duration']} steps.")
+
+    elif train_state.is_in_adaptive_phase:
+        train_state.adaptive_steps_left -= 1
+        if train_state.adaptive_steps_left <= 0:
+            train_state.is_in_adaptive_phase = False
+            if rank == 0: print(f"\nStep {train_state.step}: Adaptive Learning phase finished.")
+
+    elif not train_state.is_in_stabilization_phase and not train_state.is_in_adaptive_phase and num_modules < arch_config['max_modules'] and train_state.step > 0 and train_state.step % arch_config['convergence_check_interval'] == 0:
         if len(train_state.gating_grad_variances) > 0:
             avg_grad_variance = np.mean(list(train_state.gating_grad_variances))
             if avg_grad_variance < arch_config['stable_threshold']:
@@ -318,7 +364,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 print(f"    Module {i}: {count} activations ({percentage:.2f}%)")
             print("----------------------------------------------------")
         train_state.module_activation_counts = [0] * len(train_state.module_activation_counts)
-
 
     if rank == 0:
         count = metrics.get("count", 1.0).item()
@@ -418,6 +463,7 @@ def evaluate(config: PretrainConfig, model: nn.Module, eval_loader: torch.utils.
         final_metrics = {f"eval/{k}": v / count for k, v in total_metrics.items()}
         return final_metrics
     return None
+
 def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_state_dict: Dict[str, torch.Tensor], step: int, epoch: int, metrics_queue: mp.Queue):
     if "LOCAL_RANK" not in os.environ:
         torch.cuda.set_device(rank)
@@ -427,32 +473,23 @@ def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_st
     
     model, _, _ = create_model(config, eval_metadata, world_size)
 
-    # BUG FIX: torch.compile로 인한 state_dict 키 불일치 문제 해결
-    # 1. state_dict의 키를 분석하여 훈련된 모델의 추론 모듈 개수 파악
-    #    '_orig_mod.' 접두사를 제거하지 않고, 접두사가 붙은 상태에서 키를 분석합니다.
     prefix = "_orig_mod.model.inner.reasoning_modules."
     trained_module_keys = [k for k in model_state_dict.keys() if k.startswith(prefix)]
     if trained_module_keys:
-        # e.g., key: '_orig_mod.model.inner.reasoning_modules.1.layers.0...' -> '1' 추출
         max_trained_module_idx = max([int(k.split('.')[4]) for k in trained_module_keys])
         num_trained_modules = max_trained_module_idx + 1
     else:
         num_trained_modules = config.arch.__pydantic_extra__.get('initial_modules', 1)
 
-    # 2. 현재 평가 모델의 모듈 개수와 맞을 때까지 새로운 모듈 추가
-    #    모듈을 추가하기 위해 컴파일된 모델을 unwrap합니다.
     eval_model_unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
     while len(eval_model_unwrapped.model.inner.reasoning_modules) < num_trained_modules:
         eval_model_unwrapped.model.inner.add_new_reasoning_module()
 
-    # 3. 원본 state_dict를 컴파일된 평가 모델에 그대로 로드합니다.
-    #    접두사를 제거하지 않으므로 키가 일치하게 됩니다.
     model.load_state_dict(model_state_dict, strict=True)
 
     eval_metrics = evaluate(config, model, eval_loader, eval_metadata, rank=rank, world_size=world_size)
     
     if rank == 0 and eval_metrics is not None:
-        # wandb 로깅 대신 Queue에 결과를 넣음
         metrics_queue.put((step, epoch, eval_metrics))
 
 def rank_zero_only():
@@ -522,7 +559,6 @@ def launch(hydra_config: DictConfig):
     for _, batch, global_batch_size_effective in train_loader:
         if train_state.step >= train_state.total_steps: break
         
-        # 메인 프로세스에서 Queue를 확인하고 결과가 있으면 로깅
         if RANK == 0 and not metrics_queue.empty():
             step, epoch, eval_metrics = metrics_queue.get()
             eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}
@@ -555,7 +591,6 @@ def launch(hydra_config: DictConfig):
     
     if rank_zero_only():
         progress_bar.close()
-        # 마지막으로 큐에 남아있는 결과 처리
         while not metrics_queue.empty():
             step, epoch, eval_metrics = metrics_queue.get()
             eval_metrics_with_epoch = {**eval_metrics, "epoch": epoch}

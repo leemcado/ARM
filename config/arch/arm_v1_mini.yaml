@@ -38,3 +38,9 @@ convergence_check_interval: 1000   # 시스템 수렴 상태를 확인할 주기
 stable_threshold: 1.0e-5           # 수렴으로 판단할 그래디언트 분산의 임계값
 rate_hardprob: 0.2                # 고난도 문제로 정의할 상위 n% (0.15 = 15%)
 stabilization_duration: 5000       # 새 모듈 추가 후 안정화 학습을 진행할 기간 (훈련 스텝)
+
+# --- 적응 학습 (Adaptive Learning) 메커니즘 하이퍼파라미터 ---
+adaptive_learning:
+  duration: 2000                   # 안정화 학습 후 적응 학습을 진행할 기간 (훈련 스텝)
+  exploration_prob: 0.1            # 탐험을 위해 무작위 모듈을 선택할 확률 (10%)
+  new_module_bonus: -0.3           # 가장 최근 모듈의 예측 오류에 더해줄 보너스 점수 (음수)
