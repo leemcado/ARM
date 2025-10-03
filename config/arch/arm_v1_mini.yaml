@@ -1,27 +1,40 @@
-# ARM(Abstract Reasoning Model) 아키텍처 설정 (Mini Ver.)
-name: arm.arm_v1@ARM
+# ARM(Abstract Reasoning Model) 아키텍처 설정
+# 전두엽, 시상, 추론 모듈이 명확히 분리되고 안정적인 성장 메커니즘이 추가된 버전
+name: arm.arm_v1@ARM # 모델 클래스 경로는 유지 (향후 arm_v1.py 파일이 수정될 것임)
+
 loss:
-  name: losses@ARMLossHead 
+  name: losses@ARMLossHead
   loss_type: stablemax_cross_entropy
 
-# ACT (Adaptive Computation Time) 관련 설정은 유지합니다.
-halt_exploration_prob: 0.1
+# ACT (Adaptive Computation Time) 관련 설정
 halt_max_steps: 16
+halt_exploration_prob: 0.1
 
-# --- ARM 고유 파라미터 ---
-initial_modules: 1 # 시작 시 추론 모듈의 개수
-max_modules: 8     # 최대 추론 모듈의 개수
-inner_loops: 4 # 활성 모듈의 내부 반복 추론 횟수
+# --- 모듈별 아키텍처 하이퍼파라미터 ---
+frontal_module:
+  num_layers: 2
+  hidden_size: 256
+  num_heads: 4
+  expansion: 4
 
-# --- 새로운 성장 메커니즘을 위한 하이퍼파라미터 ---
-convergence_check_interval: 1000 # 수렴 상태를 확인할 주기 (훈련 스텝 단위)
-stable_threshold: 5.0e-3         # 그래디언트 분산이 이 값보다 낮으면 수렴으로 판단
-rate_hardprob: 0.25              # 상위 15%의 문제를 난제로 정의
-forced_allocation_duration: 4000 # 새 모듈 추가 후 난제를 강제 할당할 기간 (훈련 스텝 단위)
+thalamus_module:
+  hidden_size: 256
+  num_layers: 2
 
-# --- Transformer 파라미터 (Mini 버전에 맞게 축소) ---
-reasoning_layers: 1 # 각 추론 모듈 내부의 트랜스포머 레이어 수
-hidden_size: 128    # 256 -> 128 로 축소
-num_heads: 4        # 8 -> 4 로 축소
-expansion: 4
+reasoning_module:
+  num_layers: 1      # 각 추론 모듈 내부의 트랜스포머 레이어 수
+  hidden_size: 256
+  num_heads: 4
+  expansion: 4
+  inner_loops: 4     # 활성 추론 모듈의 내부 재귀 연산 횟수
+
+# --- 공통 Transformer 파라미터 ---
 pos_encodings: rope
+
+# --- 동적 성장 메커니즘 하이퍼파라미터 ---
+initial_modules: 1                 # 시작 시 추론 모듈의 개수
+max_modules: 8                     # 최대 추론 모듈의 개수
+convergence_check_interval: 1000   # 시스템 수렴 상태를 확인할 주기 (훈련 스텝)
+stable_threshold: 1.0e-4           # 수렴으로 판단할 그래디언트 분산의 임계값
+rate_hardprob: 0.15                # 고난도 문제로 정의할 상위 n% (0.15 = 15%)
+stabilization_duration: 2000       # 새 모듈 추가 후 안정화 학습을 진행할 기간 (훈련 스텝)
