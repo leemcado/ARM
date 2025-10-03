@@ -75,6 +75,7 @@ class TrainState:
     stabilization_steps_left: int = 0
     is_in_adaptive_phase: bool = False
     adaptive_steps_left: int = 0
+    reward_baseline: float = 0.0
     module_activation_counts: List[int] = field(default_factory=list)
 
 # --- 유틸리티 함수 ---
@@ -132,8 +133,7 @@ def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, 
             with torch.no_grad():
                 for param in list(model.parameters()) + list(model.buffers()):
                     dist.broadcast(param, src=0)
-    
-    # BUG FIX: 전두엽 모듈의 학습률을 독립적으로 제어하기 위해 파라미터 그룹 분리
+
     model_unwrapped = model._orig_mod if hasattr(model, "_orig_mod") else model
     
     frontal_params = list(model_unwrapped.model.inner.frontal_module.parameters())
@@ -199,42 +199,27 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         else:
             min_predicted_error_this_step = torch.min(predicted_errors).item()
 
-    # BUG FIX: 시상 모듈의 편견 학습을 막기 위한 '적응 학습' 단계 도입
-    if train_state.is_in_adaptive_phase and num_modules > 1:
-        with torch.no_grad():
-            # '적응 학습' 단계: 탐험(Exploration)과 신뢰 보너스(Bonus) 적용
-            adaptive_config = arch_config['adaptive_learning']
-            
-            # 1. 가장 최근에 생성된 모듈에 '신뢰 보너스'를 부여하여 선택 확률을 높임
-            predicted_errors_with_bonus = predicted_errors.clone()
-            predicted_errors_with_bonus[:, -1] += adaptive_config['new_module_bonus']
-            
-            # 2. 보너스가 적용된 점수를 기준으로 최적의 모듈을 선택
-            best_module_idx = torch.argmin(predicted_errors_with_bonus, dim=1)
-            
-            # 3. 일정 확률로 무작위 탐험을 수행하여 새로운 가능성을 발견
-            explore_mask = torch.rand(best_module_idx.shape[0], device=device) < adaptive_config['exploration_prob']
-            random_module_idx = torch.randint(0, num_modules, best_module_idx.shape, device=device)
-            
-            active_module_idx = torch.where(explore_mask, random_module_idx, best_module_idx)
+    gating_logits = -predicted_errors
 
-    elif train_state.is_in_stabilization_phase and num_modules > 1:
+    if train_state.is_in_stabilization_phase and num_modules > 1:
         with torch.no_grad():
-            # '안정화 학습' 단계: 고난도 문제 강제 할당 (정렬 기반)
             existing_module_errors = predicted_errors[:, :-1]
             active_module_idx_among_existing = torch.argmin(existing_module_errors, dim=1)
-
             difficulty = torch.min(existing_module_errors, dim=1).values
             sorted_indices = torch.argsort(difficulty, descending=True)
             num_hard_problems = int(len(difficulty) * arch_config['rate_hardprob'])
             hard_problem_indices = sorted_indices[:num_hard_problems]
-            
             new_module_idx = num_modules - 1
             active_module_idx = active_module_idx_among_existing
             active_module_idx[hard_problem_indices] = new_module_idx
     else:
-        # 일반 학습 단계: 가장 예측 오류가 낮은 모듈을 선택
-        active_module_idx = torch.argmin(predicted_errors, dim=1)
+        logits_for_sampling = gating_logits.clone()
+        if train_state.is_in_adaptive_phase and num_modules > 1:
+            adaptive_config = arch_config['adaptive_learning']
+            logits_for_sampling[:, -1] += adaptive_config['new_module_bonus']
+        
+        probs = F.softmax(logits_for_sampling, dim=-1)
+        active_module_idx = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     if config.verbose > 0:
         unique_indices, counts = torch.unique(active_module_idx, return_counts=True)
@@ -281,8 +266,25 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         carry=current_carry, final_logits=final_logits, q_halt_logits=q_halt_logits, q_continue_logits=q_continue_logits
     )
     
-    predicted_error_for_active = torch.gather(predicted_errors, 1, active_module_idx.unsqueeze(1)).squeeze(1)
-    gating_loss = F.mse_loss(predicted_error_for_active, lm_loss_per_seq.detach().to(predicted_error_for_active.dtype))
+    # BUG FIX: 안정화 단계에서는 시상 모듈의 학습을 중단하여 편견 주입을 방지
+    if train_state.is_in_stabilization_phase:
+        gating_loss = torch.tensor(0.0, device=device)
+    else:
+        with torch.no_grad():
+            rl_config = arch_config['gating_rl']
+            batch_reward_mean = lm_loss_per_seq.mean().item()
+            if train_state.step <= 1 or not train_state.is_in_adaptive_phase: # 첫 스텝 또는 새 모듈 추가 직후 baseline 초기화
+                train_state.reward_baseline = batch_reward_mean
+            else:
+                decay = rl_config['reward_baseline_decay']
+                train_state.reward_baseline = decay * train_state.reward_baseline + (1 - decay) * batch_reward_mean
+            
+            reward = (train_state.reward_baseline - lm_loss_per_seq) * rl_config['reward_scaling']
+
+        log_probs = F.log_softmax(gating_logits, dim=-1)
+        chosen_action_log_prob = log_probs.gather(1, active_module_idx.unsqueeze(-1)).squeeze(-1)
+
+        gating_loss = (-chosen_action_log_prob * reward.detach()).mean()
     
     total_loss = lm_q_loss + gating_loss
     
@@ -373,7 +375,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             "train/accuracy": metrics.get("exact_accuracy", torch.tensor(0.0)).item() / count,
             "train/similarity": metrics.get("similarity", torch.tensor(0.0)).item() / count,
             "train/lm_loss": metrics.get('lm_loss', torch.tensor(0.0)).item() / global_batch_size,
-            "train/gating_loss": gating_loss.item() / global_batch_size,
             "train/q_halt_loss": metrics.get('q_halt_loss', torch.tensor(0.0)).item() / global_batch_size,
             "train/q_continue_loss": metrics.get('q_continue_loss', torch.tensor(0.0)).item() / global_batch_size,
             "train/lr": lr_this_step,
@@ -381,8 +382,29 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             "train/hard_problem_threshold": train_state.hard_problem_threshold,
             "train/min_predicted_error": min_predicted_error_this_step,
         }
+        
+        # BUG FIX: 안정화 단계에서는 gating 관련 지표를 로깅하지 않도록 수정
+        if not train_state.is_in_stabilization_phase:
+            # 안정화 단계가 아닐 때만 gating loss 및 강화학습 관련 지표들을 추가합니다.
+            reduced_metrics["train/gating_loss"] = gating_loss.item() / global_batch_size
+            
+            with torch.no_grad():
+                # 1. 평균 보상
+                reduced_metrics["train/gating/reward"] = reward.mean().item()
+                
+                # 2. 정책 엔트로피
+                probs_for_entropy = F.softmax(gating_logits, dim=-1)
+                entropy = (-torch.sum(probs_for_entropy * torch.log(probs_for_entropy + 1e-9), dim=-1)).mean().item()
+                reduced_metrics["train/gating/policy_entropy"] = entropy
+
+                # 3. 각 모듈의 평균 선택 확률
+                mean_probs = probs_for_entropy.mean(dim=0)
+                for i in range(num_modules):
+                    reduced_metrics[f"train/gating/module_{i}_prob"] = mean_probs[i].item()
+
         if train_state.gating_grad_variances:
             reduced_metrics["train/gating_grad_variance"] = train_state.gating_grad_variances[-1]
+            
         return reduced_metrics
 
 def evaluate(config: PretrainConfig, model: nn.Module, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
