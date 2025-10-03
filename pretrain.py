@@ -266,6 +266,11 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         carry=current_carry, final_logits=final_logits, q_halt_logits=q_halt_logits, q_continue_logits=q_continue_logits
     )
     
+    # ==================== 수정된 부분 시작 ====================
+    # 'reward' 변수를 기본값으로 초기화하여 UnboundLocalError를 방지합니다.
+    reward = torch.tensor(0.0, device=device)
+    # ==================== 수정된 부분 끝 ======================
+
     # BUG FIX: 안정화 단계에서는 시상 모듈의 학습을 중단하여 편견 주입을 방지
     if train_state.is_in_stabilization_phase:
         gating_loss = torch.tensor(0.0, device=device)
@@ -308,7 +313,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
 
         for param_group in optim.param_groups:
             if param_group['name'] == 'frontal_module' and soft_update_frontal:
-                param_group['lr'] = lr_this_step * 0.01
+                param_group['lr'] = lr_this_step * 0.1
             else:
                 param_group['lr'] = lr_this_step
                 

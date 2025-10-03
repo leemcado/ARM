@@ -41,11 +41,11 @@ stabilization_duration: 5000       # 새 모듈 추가 후 안정화 학습을 �
 
 # --- 적응 학습 (Adaptive Learning) 메커니즘 하이퍼파라미터 ---
 adaptive_learning:
-  duration: 3000                   # 안정화 학습 후 적응 학습을 진행할 기간 (훈련 스텝)
+  duration: 5000                   # 안정화 학습 후 적응 학습을 진행할 기간 (훈련 스텝)
   exploration_prob: 0.1            # 탐험을 위해 무작위 모듈을 선택할 확률 (10%)
-  new_module_bonus: -0.3           # 가장 최근 모듈의 예측 오류에 더해줄 보너스 점수 (음수)
+  new_module_bonus: -0.4           # 가장 최근 모듈의 예측 오류에 더해줄 보너스 점수 (음수)
 
 # --- Gating을 위한 강화학습(REINFORCE) 하이퍼파라미터 ---
 gating_rl:
   reward_baseline_decay: 0.99      # 보상의 기준선(baseline)을 계산할 때 사용하는 지수 이동 평균 감쇠율
-  reward_scaling: 1.0              # 최종 보상에 곱해지는 스케일링 팩터
+  reward_scaling: 1.5             # 최종 보상에 곱해지는 스케일링 팩터
