@@ -120,8 +120,6 @@ class ARMLossHead(nn.Module):
             is_correct = mask & (preds == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
-            # --- 유사도(similarity) 계산 추가 ---
-            # 겹치는 픽셀 수를 전체 유효 픽셀 수로 나눔
             pixel_similarity = is_correct.sum(-1).float() / loss_counts.float()
             
             valid_metrics = carry.halted & (loss_counts > 0)
@@ -129,21 +127,20 @@ class ARMLossHead(nn.Module):
                 "count": valid_metrics.sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
                 "steps": torch.where(valid_metrics, carry.steps, 0).sum(),
-                # 평균 유사도를 메트릭에 추가
                 "similarity": torch.where(valid_metrics, pixel_similarity, 0).sum(),
             }
 
         q_halt_loss = F.binary_cross_entropy_with_logits(q_halt_logits, seq_is_correct.to(q_halt_logits.dtype), reduction="sum")
+        
+        q_continue_loss = torch.tensor(0.0, device=q_halt_logits.device)
+        if target_q_continue is not None:
+            q_continue_loss = F.binary_cross_entropy_with_logits(q_continue_logits, target_q_continue, reduction="sum")
 
         metrics.update({
             "lm_loss": total_lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
+            "q_continue_loss": q_continue_loss.detach(),
         })
-
-        q_continue_loss = 0
-        if target_q_continue is not None:
-            q_continue_loss = F.binary_cross_entropy_with_logits(q_continue_logits, target_q_continue, reduction="sum")
-            metrics["q_continue_loss"] = q_continue_loss.detach()
 
         final_loss = total_lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
 

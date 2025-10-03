@@ -18,7 +18,7 @@ frontal_module:
   expansion: 4
 
 thalamus_module:
-  hidden_size: 256
+  hidden_size: 1024
   num_layers: 2
 
 reasoning_module:
@@ -26,7 +26,7 @@ reasoning_module:
   hidden_size: 256
   num_heads: 4
   expansion: 4
-  inner_loops: 4     # 활성 추론 모듈의 내부 재귀 연산 횟수
+  inner_loops: 5     # 활성 추론 모듈의 내부 재귀 연산 횟수
 
 # --- 공통 Transformer 파라미터 ---
 pos_encodings: rope
@@ -35,6 +35,6 @@ pos_encodings: rope
 initial_modules: 1                 # 시작 시 추론 모듈의 개수
 max_modules: 8                     # 최대 추론 모듈의 개수
 convergence_check_interval: 1000   # 시스템 수렴 상태를 확인할 주기 (훈련 스텝)
-stable_threshold: 2.0e-5           # 수렴으로 판단할 그래디언트 분산의 임계값
+stable_threshold: 1.0e-5           # 수렴으로 판단할 그래디언트 분산의 임계값
 rate_hardprob: 0.2                # 고난도 문제로 정의할 상위 n% (0.15 = 15%)
 stabilization_duration: 5000       # 새 모듈 추가 후 안정화 학습을 진행할 기간 (훈련 스텝)

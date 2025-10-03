@@ -55,6 +55,7 @@ class PretrainConfig(pydantic.BaseModel):
     checkpoint_every_eval: bool = False
     eval_interval: Optional[int] = None
     eval_save_outputs: List[str] = []
+    verbose: int = 0
 
 @dataclass
 class TrainState:
@@ -72,6 +73,7 @@ class TrainState:
     system_converged: bool = False
     is_in_stabilization_phase: bool = False
     stabilization_steps_left: int = 0
+    module_activation_counts: List[int]
 
 # --- 유틸리티 함수 ---
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
@@ -136,6 +138,9 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     total_steps = int(config.epochs * train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
     model, optimizers, optimizer_lrs = create_model(config, train_metadata, world_size=world_size)
     convergence_interval = config.arch.__pydantic_extra__.get('convergence_check_interval', 1000)
+    
+    initial_module_count = config.arch.__pydantic_extra__.get('initial_modules', 1)
+    
     return TrainState(
         step=0,
         epoch=0,
@@ -145,7 +150,8 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
         optimizer_lrs=optimizer_lrs,
         carry=None,
         gating_grad_variances=deque(maxlen=convergence_interval),
-        min_predicted_errors=deque(maxlen=convergence_interval)
+        min_predicted_errors=deque(maxlen=convergence_interval),
+        module_activation_counts=[0] * initial_module_count
     )
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
@@ -181,7 +187,12 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             is_hard_mask = difficulty > train_state.hard_problem_threshold
             new_module_idx = num_modules - 1
             active_module_idx = torch.where(is_hard_mask, new_module_idx, active_module_idx)
-    
+
+    if config.verbose > 0:
+        unique_indices, counts = torch.unique(active_module_idx, return_counts=True)
+        for idx, count in zip(unique_indices.tolist(), counts.tolist()):
+            train_state.module_activation_counts[idx] += count
+
     cos_sin = train_state.model.model.inner.rotary_emb() if hasattr(train_state.model.model.inner, "rotary_emb") else None
     
     all_z_r_a_t_plus_1 = torch.empty_like(z_r_states_t[0])
@@ -266,7 +277,7 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             train_state.system_converged = False 
             if rank == 0: print(f"\nStep {train_state.step}: Stabilization phase finished.")
     
-    elif train_state.step > 0 and train_state.step % arch_config['convergence_check_interval'] == 0:
+    elif num_modules < arch_config['max_modules'] and train_state.step > 0 and train_state.step % arch_config['convergence_check_interval'] == 0:
         if len(train_state.gating_grad_variances) > 0:
             avg_grad_variance = np.mean(list(train_state.gating_grad_variances))
             if avg_grad_variance < arch_config['stable_threshold']:
@@ -279,9 +290,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
                 if train_state.model.model.inner.add_new_reasoning_module():
                     train_state.is_in_stabilization_phase = True
                     train_state.stabilization_steps_left = arch_config['stabilization_duration']
+                    train_state.module_activation_counts.append(0)
                     with torch.no_grad():
                         new_z_r = torch.zeros_like(train_state.carry.inner_carry.z_r_states[0])
                         train_state.carry.inner_carry.z_r_states.append(new_z_r)
+
+    if config.verbose > 0 and train_state.step % config.verbose == 0 and rank == 0:
+        total_activations = sum(train_state.module_activation_counts)
+        if total_activations > 0:
+            print(f"\n--- Module Activation Frequency (Steps {train_state.step - config.verbose + 1}-{train_state.step}) ---")
+            for i, count in enumerate(train_state.module_activation_counts):
+                percentage = (count / total_activations) * 100
+                print(f"    Module {i}: {count} activations ({percentage:.2f}%)")
+            print("----------------------------------------------------")
+        train_state.module_activation_counts = [0] * len(train_state.module_activation_counts)
+
 
     if rank == 0:
         count = metrics.get("count", 1.0).item()
@@ -292,6 +315,8 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             "train/similarity": metrics.get("similarity", torch.tensor(0.0)).item() / count,
             "train/lm_loss": metrics.get('lm_loss', torch.tensor(0.0)).item() / global_batch_size,
             "train/gating_loss": gating_loss.item() / global_batch_size,
+            "train/q_halt_loss": metrics.get('q_halt_loss', torch.tensor(0.0)).item() / global_batch_size,
+            "train/q_continue_loss": metrics.get('q_continue_loss', torch.tensor(0.0)).item() / global_batch_size,
             "train/lr": lr_this_step,
             "train/current_module_count": num_modules,
             "train/hard_problem_threshold": train_state.hard_problem_threshold,
@@ -385,7 +410,8 @@ def evaluate_worker(rank: int, world_size: int, config: PretrainConfig, model_st
         torch.cuda.set_device(rank)
 
     if rank == 0:
-        wandb.init(project=config.project_name, id=run_id, resume="must")
+        # BUG FIX: Timeout을 방지하기 위해 init_timeout 설정 추가
+        wandb.init(project=config.project_name, id=run_id, resume="must", settings=wandb.Settings(init_timeout=600))
     
     _, eval_metadata = create_dataloader(config, "test", rank=rank, world_size=world_size)
     eval_loader, _ = create_dataloader(config, "test", rank=rank, world_size=world_size) 
@@ -457,7 +483,6 @@ def launch(hydra_config: DictConfig):
     eval_process = None
     run_id = None
 
-    # BUG FIX: steps_per_epoch를 메타데이터로부터 직접 계산
     steps_per_epoch = int(train_metadata.total_groups * train_metadata.mean_puzzle_examples / config.global_batch_size)
 
     if rank_zero_only():
