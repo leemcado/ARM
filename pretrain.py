@@ -25,7 +25,7 @@ from utils.functions import load_model_class, get_model_source_path
 from models.losses import IGNORE_LABEL_ID, ARMLossHead
 from models.arm.arm_v1 import ARM, ARMCarry, ARMInnerCarry
 
-# --- 설정 및 상태 클래스 (변경 없음) ---
+# --- 설정 및 상태 클래스 (Pydantic 모델) ---
 class LossConfig(pydantic.BaseModel):
     model_config = pydantic.ConfigDict(extra='allow')
     name: str
@@ -59,7 +59,7 @@ class TrainState:
     model: nn.Module
     optimizers: Sequence[torch.optim.Optimizer]
     optimizer_lrs: Sequence[float]
-    carry: Any  # carry 객체를 TrainState가 직접 관리
+    carry: Any
     step: int
     total_steps: int
     
@@ -70,10 +70,9 @@ class TrainState:
     is_in_stabilization_phase: bool = False
     stabilization_steps_left: int = 0
 
-# --- 유틸리티 함수 (변경 없음) ---
+# --- 유틸리티 함수 ---
 def create_dataloader(config: PretrainConfig, split: str, rank: int, world_size: int, **kwargs):
     is_train = split == 'train'
-    # epochs_per_iter: eval_interval이 None일 경우 전체 epochs를 사용하도록 수정
     epochs_per_iter = config.eval_interval if is_train and config.eval_interval is not None else (config.epochs if is_train else 1)
     
     dataset_config = PuzzleDatasetConfig(
@@ -107,7 +106,6 @@ def compute_lr(base_lr: float, config: PretrainConfig, train_state: TrainState):
         min_ratio=config.lr_min_ratio
     )
 
-# --- 모델 및 TrainState 초기화 함수 (carry=None 추가) ---
 def create_model(config: PretrainConfig, train_metadata: PuzzleDatasetMetadata, world_size: int):
     model_cfg = dict(
         **config.arch.__pydantic_extra__,
@@ -137,14 +135,16 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     convergence_interval = config.arch.__pydantic_extra__.get('convergence_check_interval', 1000)
     return TrainState(
         step=0, total_steps=total_steps, model=model, optimizers=optimizers, optimizer_lrs=optimizer_lrs,
-        carry=None, # carry는 첫 배치에서 초기화
+        carry=None,
         gating_grad_variances=deque(maxlen=convergence_interval),
         min_predicted_errors=deque(maxlen=convergence_interval)
     )
 
-# --- train_batch 함수 최종 수정 ---
-# 각 호출이 하나의 시간 스텝(t) 역할을 하도록 수정
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
+    # --- ZeroDivisionError 해결을 위한 가드 추가 ---
+    if global_batch_size == 0:
+        return None
+
     train_state.step += 1
     if train_state.step > train_state.total_steps: return
 
@@ -152,24 +152,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     device = "cuda"
     batch = {k: v.to(device) for k, v in batch.items()}
     
-    # Carry가 없으면(첫 스텝) 초기화
     if train_state.carry is None:
         train_state.carry = train_state.model.initial_carry(batch)
 
-    # --- ACT 로직: 멈춘 시퀀스 리셋 ---
-    # 멈춘(halted) 시퀀스의 데이터를 새 데이터로 교체하고, 히든 스테이트와 스텝 카운터를 0으로 리셋
     current_carry = train_state.carry
     z_f_t = torch.where(current_carry.halted.view(-1, 1, 1), 0.0, current_carry.inner_carry.z_f)
     z_r_states_t = [torch.where(current_carry.halted.view(-1, 1, 1), 0.0, z) for z in current_carry.inner_carry.z_r_states]
     current_carry.steps = torch.where(current_carry.halted, 0, current_carry.steps)
     current_carry.current_data = {k: torch.where(current_carry.halted.view(-1, *([1]*(v.dim()-1))), batch[k], v) for k, v in current_carry.current_data.items()}
     
-    # --- 순전파 (1 time-step) ---
     input_embeddings = train_state.model.model.inner._input_embeddings(current_carry.current_data["inputs"])
     num_modules = len(train_state.model.model.inner.reasoning_modules)
     predicted_errors = train_state.model.model.inner.thalamus_module(z_f_t, input_embeddings)[:, :num_modules]
     
     with torch.no_grad():
+        min_predicted_error_this_step = torch.min(predicted_errors).item()
         active_module_idx = torch.argmin(predicted_errors, dim=1)[0].item()
         if train_state.is_in_stabilization_phase and num_modules > 1:
             difficulty = torch.min(predicted_errors[:, :-1], dim=1).values
@@ -192,20 +189,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         min_halt_steps = (torch.rand_like(q_halt_logits) < arch_config['halt_exploration_prob']) * torch.randint_like(current_carry.steps, low=2, high=arch_config['halt_max_steps'] + 1)
         current_carry.halted = halted & (current_carry.steps >= min_halt_steps)
     
-    # --- 역전파 ---
     freeze_frontal = train_state.is_in_stabilization_phase and (active_module_idx == num_modules - 1)
     if freeze_frontal:
         for param in train_state.model.model.inner.frontal_module.parameters(): param.requires_grad_(False)
 
-    lm_q_loss, metrics = train_state.model(carry=current_carry, final_logits=final_logits, q_halt_logits=q_halt_logits, q_continue_logits=q_continue_logits)
+    lm_q_loss, metrics, lm_loss_per_seq = train_state.model(
+        carry=current_carry, final_logits=final_logits, q_halt_logits=q_halt_logits, q_continue_logits=q_continue_logits
+    )
+    
     predicted_error_for_active = predicted_errors[:, active_module_idx]
-    actual_lm_loss = metrics.get('lm_loss', torch.tensor(0.0, device=device))
-    gating_loss = F.mse_loss(predicted_error_for_active, actual_lm_loss.detach())
+    gating_loss = F.mse_loss(predicted_error_for_active, lm_loss_per_seq.detach().to(predicted_error_for_active.dtype))
+    
     total_loss = lm_q_loss + gating_loss
     
     total_loss.backward()
 
-    # 수렴 판단을 위한 그래디언트 분산 계산 (역전파 직후)
     with torch.no_grad():
         gate_grads = [p.grad for p in train_state.model.model.inner.thalamus_module.parameters() if p.grad is not None]
         if gate_grads:
@@ -215,7 +213,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
     if freeze_frontal:
         for param in train_state.model.model.inner.frontal_module.parameters(): param.requires_grad_(True)
             
-    # --- 옵티마이저 스텝 ---
     if world_size > 1:
         for param in train_state.model.parameters():
             if param.grad is not None: dist.all_reduce(param.grad)
@@ -227,18 +224,15 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         optim.step()
         optim.zero_grad()
 
-    # --- 다음 스텝을 위한 Carry 상태 업데이트 (그래프 분리) ---
     with torch.no_grad():
         current_carry.inner_carry.z_f = z_f_t_plus_1.detach()
         z_r_states_t[active_module_idx] = z_r_a_t_plus_1.detach()
-        # 비활성 모듈은 이전 상태를 그대로 유지(detach)
         for i in range(len(z_r_states_t)):
             if i != active_module_idx:
                 z_r_states_t[i] = z_r_states_t[i].detach()
         current_carry.inner_carry.z_r_states = z_r_states_t
 
-    # --- 성장 메커니즘 상태 머신 ---
-    train_state.min_predicted_errors.append(torch.min(predicted_errors).item())
+    train_state.min_predicted_errors.append(min_predicted_error_this_step)
     
     if train_state.is_in_stabilization_phase:
         train_state.stabilization_steps_left -= 1
@@ -253,7 +247,6 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         if train_state.model.model.inner.add_new_reasoning_module():
             train_state.is_in_stabilization_phase = True
             train_state.stabilization_steps_left = arch_config['stabilization_duration']
-            # 새 모듈에 대한 히든 스테이트를 carry에 추가
             with torch.no_grad():
                 new_z_r = torch.zeros_like(train_state.carry.inner_carry.z_r_states[0])
                 train_state.carry.inner_carry.z_r_states.append(new_z_r)
@@ -266,20 +259,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
             if rank == 0:
                 print(f"\nStep {train_state.step}: System converged with avg grad variance {avg_grad_variance:.2E}")
 
-    # --- 메트릭 로깅 ---
     if rank == 0:
         count = metrics.get("count", 1.0).item()
-        reduced_metrics = {f"train/{k}": v.item() / count for k, v in metrics.items() if k != "count"}
+        if count == 0: count = 1
+        
+        reduced_metrics = {"train/accuracy": metrics.get("exact_accuracy", 0.0).item() / count}
         reduced_metrics["train/lm_loss"] = metrics.get('lm_loss', torch.tensor(0.0)).item() / global_batch_size
         reduced_metrics["train/gating_loss"] = gating_loss.item() / global_batch_size
         reduced_metrics["train/lr"] = lr_this_step
         reduced_metrics["train/current_module_count"] = num_modules
         reduced_metrics["train/hard_problem_threshold"] = train_state.hard_problem_threshold
+        reduced_metrics["train/min_predicted_error"] = min_predicted_error_this_step
         if train_state.gating_grad_variances:
             reduced_metrics["train/gating_grad_variance"] = train_state.gating_grad_variances[-1]
         return reduced_metrics
 
-# --- 평가 함수 최종 수정 ---
 def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     train_state.model.eval()
     all_metrics_list = []
@@ -287,8 +281,11 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
     
     with torch.inference_mode():
         for set_name, batch, global_batch_size in eval_loader:
+            if global_batch_size == 0: continue
             batch = {k: v.cuda() for k, v in batch.items()}
             carry = train_state.model.initial_carry(batch)
+            
+            z_f_t_plus_1 = carry.inner_carry.z_f
 
             for t in range(arch_config['halt_max_steps']):
                 z_f_t = carry.inner_carry.z_f
@@ -308,11 +305,6 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                 carry.inner_carry.z_f = z_f_t_plus_1
                 z_r_states_t[active_module_idx] = z_r_a_t_plus_1
                 carry.inner_carry.z_r_states = z_r_states_t
-                
-                q_logits = train_state.model.model.inner.q_head(z_f_t_plus_1[:, 0, :])
-                # 평가 시에는 argmax로 결정 (탐험 없음)
-                if q_logits[..., 0] > q_logits[..., 1] or (t == arch_config['halt_max_steps'] - 1):
-                    break
             
             final_logits = train_state.model.model.inner.lm_head(z_f_t_plus_1)
             labels = carry.current_data["labels"]
@@ -339,27 +331,30 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
 
     if rank == 0:
         count = total_metrics.pop("count")
+        if count == 0: count = 1
         final_metrics = {f"eval/{k}": v / count for k, v in total_metrics.items()}
         return final_metrics
     return None
 
-# --- 파일 저장 및 W&B 로깅, 메인 실행 함수 (변경 없음) ---
+def rank_zero_only():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
 def save_train_state(config: PretrainConfig, train_state: TrainState):
-    if config.checkpoint_path is None or rank_zero_only(): return
+    if config.checkpoint_path is None or not rank_zero_only(): return
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    model_state = train_state.model.state_dict()
-    if hasattr(train_state.model, 'module'): model_state = train_state.model.module.state_dict()
+    model = train_state.model
+    if hasattr(model, "_orig_mod"): model = model._orig_mod
+    
+    model_state = model.state_dict()
+    if hasattr(model, 'module'):
+        model_state = model.module.state_dict()
     torch.save(model_state, os.path.join(config.checkpoint_path, f"step_{train_state.step}.pth"))
 
-def save_code_and_config(config: PretrainConfig):
+def save_code_and_config(config: PretrainConfig, hydra_config: DictConfig):
     if config.checkpoint_path is None or not rank_zero_only() or wandb.run is None: return
     os.makedirs(config.checkpoint_path, exist_ok=True)
-    code_files = [get_model_source_path(config.arch.name), get_model_source_path(config.arch.loss.name)]
-    for code_file in code_files:
-        if code_file and os.path.exists(code_file):
-            shutil.copy(code_file, os.path.join(config.checkpoint_path, os.path.basename(code_file)))
     with open(os.path.join(config.checkpoint_path, "all_config.yaml"), "w") as f:
-        yaml.dump(OmegaConf.to_container(config, resolve=True), f)
+        yaml.dump(OmegaConf.to_container(hydra_config, resolve=True), f)
 
 def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> PretrainConfig:
     objects = [None]
@@ -371,9 +366,6 @@ def load_synced_config(hydra_config: DictConfig, rank: int, world_size: int) -> 
         objects = [config]
     if world_size > 1: dist.broadcast_object_list(objects, src=0)
     return objects[0]
-
-def rank_zero_only():
-    return not dist.is_initialized() or dist.get_rank() == 0
 
 @hydra.main(config_path="config", config_name="cfg_pretrain", version_base=None)
 def launch(hydra_config: DictConfig):
@@ -396,16 +388,16 @@ def launch(hydra_config: DictConfig):
     progress_bar = None
     if rank_zero_only():
         progress_bar = tqdm.tqdm(total=train_state.total_steps, desc="Training")
-        wandb.init(project=config.project_name, name=config.run_name, config=OmegaConf.to_container(config, resolve=True))
+        wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump())
         wandb.watch(train_state.model, log_freq=100)
         wandb.log({"num_params": sum(p.numel() for p in train_state.model.parameters())}, step=0)
-        save_code_and_config(config)
+        save_code_and_config(config, hydra_config)
 
-    for epoch in range(config.epochs):
-        if rank_zero_only(): print(f"\nStarting Epoch {epoch+1}/{config.epochs}")
+    while train_state.step < train_state.total_steps:
+        train_iter = iter(train_loader)
         
         train_state.model.train()
-        for _, batch, global_batch_size_effective in train_loader:
+        for _, batch, global_batch_size_effective in train_iter:
             if train_state.step >= train_state.total_steps: break
             
             metrics = train_batch(config, train_state, batch, global_batch_size_effective, rank=RANK, world_size=WORLD_SIZE)
@@ -414,16 +406,14 @@ def launch(hydra_config: DictConfig):
                 wandb.log(metrics, step=train_state.step)
                 progress_bar.update(1)
         
-        if train_state.step >= train_state.total_steps: break
-
-        if config.eval_interval and (epoch + 1) % config.eval_interval == 0:
-            eval_metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
-            if rank_zero_only() and eval_metrics is not None:
-                wandb.log(eval_metrics, step=train_state.step)
-            
-            if config.checkpoint_every_eval:
-                save_train_state(config, train_state)
-
+            if config.eval_interval and train_state.step > 0 and train_state.step % config.eval_interval == 0:
+                eval_metrics = evaluate(config, train_state, eval_loader, eval_metadata, rank=RANK, world_size=WORLD_SIZE)
+                if rank_zero_only() and eval_metrics is not None:
+                    wandb.log(eval_metrics, step=train_state.step)
+                
+                if config.checkpoint_every_eval:
+                    save_train_state(config, train_state)
+    
     if rank_zero_only():
         progress_bar.close()
         save_train_state(config, train_state)

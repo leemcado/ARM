@@ -32,12 +32,9 @@ def stablemax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
-    # Cast logits to f32
-    # Flatten logits
     return F.cross_entropy(logits.to(torch.float32).view(-1, logits.shape[-1]), labels.to(torch.long).view(-1), ignore_index=ignore_index, reduction="none").view(labels.shape)
 
 
-# 기존 ACTLossHead는 HRM을 위해 그대로 둡니다.
 class ACTLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
@@ -50,7 +47,6 @@ class ACTLossHead(nn.Module):
     def forward(
         self,
         return_keys: Sequence[str],
-        # Model args
         **model_kwargs,
     ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
         new_carry, outputs = self.model(**model_kwargs)
@@ -91,7 +87,6 @@ class ACTLossHead(nn.Module):
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
 
 
-# +++ ARM을 위한 새로운 Loss Head 클래스 수정 +++
 class ARMLossHead(nn.Module):
     def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
@@ -103,27 +98,22 @@ class ARMLossHead(nn.Module):
 
     def forward(
         self,
-        # pretrain.py의 커스텀 훈련 루프에 의해 직접 제어되도록 인터페이스를 변경합니다.
         carry: Any,
-        # 외부에서 계산된 값들을 직접 인자로 받습니다.
-        final_logits: torch.Tensor, # 전두엽 모듈의 최종 출력 로짓
+        final_logits: torch.Tensor,
         q_halt_logits: torch.Tensor,
         q_continue_logits: torch.Tensor,
         target_q_continue: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]: # 반환 값에서 carry, detached_outputs 등을 제거하여 단순화
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]: # 반환 값 개수 수정 (3개)
         
         labels = carry.current_data["labels"]
 
-        # --- 1. LM Loss 계산 ---
-        # pretrain.py에서 활성 모듈의 로짓 하나만 넘어오므로, 루프 없이 직접 계산합니다.
         mask = labels != IGNORE_LABEL_ID
         loss_counts = mask.sum(-1)
-        loss_divisor = loss_counts.clamp_min(1) # B, 
+        loss_divisor = loss_counts.clamp_min(1)
         
         lm_loss_per_seq = self.loss_fn(final_logits, labels, ignore_index=IGNORE_LABEL_ID).sum(-1) / loss_divisor
         total_lm_loss = torch.where(carry.halted, lm_loss_per_seq, 0).sum()
 
-        # --- 2. 정확도 및 Q-러닝 관련 메트릭 계산 ---
         with torch.no_grad():
             is_correct = mask & (torch.argmax(final_logits, dim=-1) == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
@@ -135,11 +125,10 @@ class ARMLossHead(nn.Module):
                 "steps": torch.where(valid_metrics, carry.steps, 0).sum(),
             }
 
-        # --- 3. Q-러닝 손실 계산 ---
         q_halt_loss = F.binary_cross_entropy_with_logits(q_halt_logits, seq_is_correct.to(q_halt_logits.dtype), reduction="sum")
 
         metrics.update({
-            "lm_loss": total_lm_loss.detach(), # 시상 모듈 학습을 위해 detach된 lm_loss를 metrics에 포함
+            "lm_loss": total_lm_loss.detach(),
             "q_halt_loss": q_halt_loss.detach(),
         })
 
@@ -148,7 +137,8 @@ class ARMLossHead(nn.Module):
             q_continue_loss = F.binary_cross_entropy_with_logits(q_continue_logits, target_q_continue, reduction="sum")
             metrics["q_continue_loss"] = q_continue_loss.detach()
 
-        # pretrain.py에서 gating_loss가 별도로 추가될 것이므로, 여기서는 LM Loss와 Q-Loss만 합산
         final_loss = total_lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
 
-        return final_loss, metrics
+        # --- 반환 값 수정 ---
+        # pretrain.py가 3개의 값을 기대하므로, 3개의 값을 반환합니다.
+        return final_loss, metrics, lm_loss_per_seq
