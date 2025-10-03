@@ -141,9 +141,7 @@ def init_train_state(config: PretrainConfig, train_metadata: PuzzleDatasetMetada
     )
 
 def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, global_batch_size: int, rank: int, world_size: int):
-    # --- ZeroDivisionError 해결을 위한 가드 추가 ---
-    if global_batch_size == 0:
-        return None
+    if global_batch_size == 0: return None
 
     train_state.step += 1
     if train_state.step > train_state.total_steps: return
@@ -263,17 +261,21 @@ def train_batch(config: PretrainConfig, train_state: TrainState, batch: Any, glo
         count = metrics.get("count", 1.0).item()
         if count == 0: count = 1
         
-        reduced_metrics = {"train/accuracy": metrics.get("exact_accuracy", 0.0).item() / count}
-        reduced_metrics["train/lm_loss"] = metrics.get('lm_loss', torch.tensor(0.0)).item() / global_batch_size
-        reduced_metrics["train/gating_loss"] = gating_loss.item() / global_batch_size
-        reduced_metrics["train/lr"] = lr_this_step
-        reduced_metrics["train/current_module_count"] = num_modules
-        reduced_metrics["train/hard_problem_threshold"] = train_state.hard_problem_threshold
-        reduced_metrics["train/min_predicted_error"] = min_predicted_error_this_step
+        reduced_metrics = {
+            "train/accuracy": metrics.get("exact_accuracy", torch.tensor(0.0)).item() / count,
+            "train/similarity": metrics.get("similarity", torch.tensor(0.0)).item() / count, # 유사도 로깅
+            "train/lm_loss": metrics.get('lm_loss', torch.tensor(0.0)).item() / global_batch_size,
+            "train/gating_loss": gating_loss.item() / global_batch_size,
+            "train/lr": lr_this_step,
+            "train/current_module_count": num_modules,
+            "train/hard_problem_threshold": train_state.hard_problem_threshold,
+            "train/min_predicted_error": min_predicted_error_this_step,
+        }
         if train_state.gating_grad_variances:
             reduced_metrics["train/gating_grad_variance"] = train_state.gating_grad_variances[-1]
         return reduced_metrics
 
+# --- evaluate 함수 최종 수정 ---
 def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch.utils.data.DataLoader, eval_metadata: PuzzleDatasetMetadata, rank: int, world_size: int):
     train_state.model.eval()
     all_metrics_list = []
@@ -285,8 +287,10 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             batch = {k: v.cuda() for k, v in batch.items()}
             carry = train_state.model.initial_carry(batch)
             
+            # 루프 밖에서 z_f_t_plus_1 초기화
             z_f_t_plus_1 = carry.inner_carry.z_f
 
+            # --- 평가 로직 수정: ACT 비활성화하고 고정 스텝으로 변경 ---
             for t in range(arch_config['halt_max_steps']):
                 z_f_t = carry.inner_carry.z_f
                 z_r_states_t = carry.inner_carry.z_r_states
@@ -302,6 +306,7 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
                 z_r_a_t_plus_1 = train_state.model.model.inner.reasoning_modules[active_module_idx](z_r_states_t[active_module_idx], z_f_t, input_embeddings, cos_sin=cos_sin)
                 z_f_t_plus_1 = train_state.model.model.inner.frontal_module(z_f_t, z_r_a_t_plus_1, cos_sin=cos_sin)
                 
+                # 다음 스텝을 위해 상태 업데이트
                 carry.inner_carry.z_f = z_f_t_plus_1
                 z_r_states_t[active_module_idx] = z_r_a_t_plus_1
                 carry.inner_carry.z_r_states = z_r_states_t
@@ -310,10 +315,18 @@ def evaluate(config: PretrainConfig, train_state: TrainState, eval_loader: torch
             labels = carry.current_data["labels"]
             mask = labels != IGNORE_LABEL_ID
             loss_counts = mask.sum(-1)
-            is_correct = mask & (torch.argmax(final_logits, dim=-1) == labels)
+            
+            preds = torch.argmax(final_logits, dim=-1)
+            is_correct = mask & (preds == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
             
-            metrics = {"count": torch.tensor(loss_counts.shape[0], device="cuda", dtype=torch.float32), "exact_accuracy": seq_is_correct.float().sum()}
+            pixel_similarity = is_correct.sum(-1).float() / loss_counts.float().clamp_min(1)
+
+            metrics = {
+                "count": torch.tensor(loss_counts.shape[0], device="cuda", dtype=torch.float32),
+                "exact_accuracy": seq_is_correct.float().sum(),
+                "similarity": pixel_similarity.sum(),
+            }
             all_metrics_list.append(metrics)
             
     if not all_metrics_list: return None

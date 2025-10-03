@@ -36,6 +36,7 @@ def softmax_cross_entropy(logits, labels, ignore_index: int = -100):
 
 
 class ACTLossHead(nn.Module):
+    # (이전 버전의 HRM을 위한 클래스이므로 변경 없음)
     def __init__(self, model: nn.Module, loss_type: str):
         super().__init__()
         self.model = model
@@ -103,7 +104,7 @@ class ARMLossHead(nn.Module):
         q_halt_logits: torch.Tensor,
         q_continue_logits: torch.Tensor,
         target_q_continue: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]: # 반환 값 개수 수정 (3개)
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
         
         labels = carry.current_data["labels"]
 
@@ -115,14 +116,21 @@ class ARMLossHead(nn.Module):
         total_lm_loss = torch.where(carry.halted, lm_loss_per_seq, 0).sum()
 
         with torch.no_grad():
-            is_correct = mask & (torch.argmax(final_logits, dim=-1) == labels)
+            preds = torch.argmax(final_logits, dim=-1)
+            is_correct = mask & (preds == labels)
             seq_is_correct = is_correct.sum(-1) == loss_counts
+            
+            # --- 유사도(similarity) 계산 추가 ---
+            # 겹치는 픽셀 수를 전체 유효 픽셀 수로 나눔
+            pixel_similarity = is_correct.sum(-1).float() / loss_counts.float()
             
             valid_metrics = carry.halted & (loss_counts > 0)
             metrics = {
                 "count": valid_metrics.sum(),
                 "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
                 "steps": torch.where(valid_metrics, carry.steps, 0).sum(),
+                # 평균 유사도를 메트릭에 추가
+                "similarity": torch.where(valid_metrics, pixel_similarity, 0).sum(),
             }
 
         q_halt_loss = F.binary_cross_entropy_with_logits(q_halt_logits, seq_is_correct.to(q_halt_logits.dtype), reduction="sum")
@@ -139,6 +147,4 @@ class ARMLossHead(nn.Module):
 
         final_loss = total_lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
 
-        # --- 반환 값 수정 ---
-        # pretrain.py가 3개의 값을 기대하므로, 3개의 값을 반환합니다.
         return final_loss, metrics, lm_loss_per_seq
