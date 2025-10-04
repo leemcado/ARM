@@ -12,9 +12,9 @@ halt_exploration_prob: 0.1
 
 # --- 모듈별 아키텍처 하이퍼파라미터 ---
 frontal_module:
-  num_layers: 2
+  num_layers: 3
   hidden_size: 256
-  num_heads: 4
+  num_heads: 8
   expansion: 4
 
 thalamus_module:
@@ -22,9 +22,9 @@ thalamus_module:
   num_layers: 2
 
 reasoning_module:
-  num_layers: 1      # 각 추론 모듈 내부의 트랜스포머 레이어 수
+  num_layers: 2      # 각 추론 모듈 내부의 트랜스포머 레이어 수
   hidden_size: 256
-  num_heads: 4
+  num_heads: 8
   expansion: 4
   inner_loops: 5     # 활성 추론 모듈의 내부 재귀 연산 횟수
 
@@ -34,16 +34,16 @@ pos_encodings: rope
 # --- 동적 성장 메커니즘 하이퍼파라미터 ---
 initial_modules: 1                 # 시작 시 추론 모듈의 개수
 max_modules: 8                     # 최대 추론 모듈의 개수
-convergence_check_interval: 1000   # 시스템 수렴 상태를 확인할 주기 (훈련 스텝)
+convergence_check_interval: 500   # 시스템 수렴 상태를 확인할 주기 (훈련 스텝)
 stable_threshold: 2e-8           # 수렴으로 판단할 그래디언트 분산의 임계값
-rate_hardprob: 0.25 #0.2               # 고난도 문제로 정의할 상위 n% (0.15 = 15%)
-stabilization_duration: 4000       # 새 모듈 추가 후 안정화 학습을 진행할 기간 (훈련 스텝)
+rate_hardprob: 0.1 #0.2               # 고난도 문제로 정의할 상위 n% (0.15 = 15%)
+stabilization_duration: 7000       # 새 모듈 추가 후 안정화 학습을 진행할 기간 (훈련 스텝)
 
 # --- 적응 학습 (Adaptive Learning) 메커니즘 하이퍼파라미터 ---
 adaptive_learning:
   duration: 4000 #3000                  # 안정화 학습 후 적응 학습을 진행할 기간 (훈련 스텝)
   exploration_prob: 0.1            # 탐험을 위해 무작위 모듈을 선택할 확률 (10%)
-  new_module_bonus: -0.4 #-0.3           # 가장 최근 모듈의 예측 오류에 더해줄 보너스 점수 (음수)
+  new_module_bonus: -0.3 #-0.3           # 가장 최근 모듈의 예측 오류에 더해줄 보너스 점수 (음수)
 
 # --- Gating을 위한 강화학습(REINFORCE) 하이퍼파라미터 ---
 gating_rl:
